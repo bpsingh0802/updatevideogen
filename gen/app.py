@@ -2475,7 +2475,7 @@
 
 
 
-
+# One the Best Code
 import os
 import sys
 import time
@@ -2556,7 +2556,7 @@ def load_model(language):
 # === AI and Presentation Functions ===
 def generate_script_with_ai(topic, num_steps=5):
     # You can change this to use environment variable if you want
-    api_key = 'AIzaSyD5cxjWRn0uqRwZIg4ZTpZuInpKYUkq2Ik'
+    api_key = 'AIzaSyDsX3v0ZmjN5Rezia5CnFaEbNlvbAjwy18'
     if not api_key:
         logger.error("GEMINI_API_KEY not set")
         raise RuntimeError("GEMINI_API_KEY not provided")
@@ -2649,9 +2649,6 @@ def parse_script(script_text, topic):
 # === Image Generation Functions (Helpers) ===
 # ==================================================================
 #
-
-
-
 def get_font_path(font_size=60):
     font_paths = [
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -2897,32 +2894,27 @@ def preprocess_text_for_tts(text: str) -> str:
     text = text.replace("! ", "! . ")
 
     return text
+
 def create_audio_segments(slides, topic_title):
     audio_paths = []
-    pause_segment = AudioSegment.silent(duration=350)  # small natural pause at end of slide
+    pause_segment = AudioSegment.silent(duration=350)  # small natural pause at end of each slide
 
     for i, slide in enumerate(slides):
-
-        # For audio: remove bullets + merge lines
+        # For audio: title + content, but content without bullets/newlines
         content_for_audio = slide['content'].replace("•", " ")
         content_for_audio = re.sub(r'\s+', ' ', content_for_audio).strip()
 
         script_text = f"{slide['title']}. {content_for_audio}"
-        if not script_text.strip():
+        if not script_text or not script_text.strip():
             continue
 
         # Auto-pause injection for MMS TTS
         script_text_for_tts = preprocess_text_for_tts(script_text)
 
         sanitized_topic = "".join(c for c in topic_title if c.isalnum())[:15]
-        temp_wav_path = os.path.join(
-            TEMP_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}_temp.wav"
-        )
-        audio_path = os.path.join(
-            TEMP_DIR, f"{sanitized_topic}_slide{i+1}_{uuid4().hex[:8]}.mp3"
-        )
+        temp_wav_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}_temp.wav")
+        audio_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_slide{i+1}_{uuid4().hex[:8]}.mp3")
 
-        # Detect language and load TTS
         lang = detect_language(script_text_for_tts)
         model, tokenizer = load_model(lang)
 
@@ -2933,47 +2925,40 @@ def create_audio_segments(slides, topic_title):
         waveform = outputs[0].cpu().numpy()
         rate = model.config.sampling_rate
 
-        # Save RAW TTS output
+        # Save raw output
         sf.write(temp_wav_path, waveform, rate)
 
-        # Load into pydub
+        # Load into pydub for humanization
         audio = AudioSegment.from_wav(temp_wav_path)
 
         # -------------------------
-        #  ⭐ BEST HUMANIZATION (No crack, warm, smooth)
+        #  HUMANIZATION PROCESSING
         # -------------------------
 
-        # 1. Gentle compression (removes clipping & crack)
-        audio = audio.compress_dynamic_range(
-            threshold=-25.0,
-            ratio=3.0,
-            attack=5,
-            release=50
-        )
+        # 1. Slight low-pass to soften harsh robotic highs
+        audio = audio.low_pass_filter(7000)
 
-        # 2. Remove metallic peaks & rumble
-        audio = audio.low_pass_filter(5500)   # soften robotic highs
-        audio = audio.high_pass_filter(120)   # remove low digital noise
-
-        # 3. Slight pitch warmth (makes it smooth, LESS cracking)
+        # 2. Slight pitch warmth (decrease frame rate a bit)
         audio = audio._spawn(audio.raw_data, overrides={
-            "frame_rate": int(audio.frame_rate * 0.975)    # 97.5% = clean
+            "frame_rate": int(audio.frame_rate * 0.94)
         }).set_frame_rate(audio.frame_rate)
 
-        # 4. Add soft fade edges (removes click/pop sounds)
-        audio = audio.fade_in(80).fade_out(120)
+        # 3. Speed normalization (slightly faster to feel natural)
+        try:
+            audio = audio.speedup(playback_speed=1.06, chunk_size=50, crossfade=20)
+        except Exception as e:
+            logger.warning(f"Speedup failed for slide {i+1}, using original speed: {e}")
 
-        # 5. Add small breath (natural feel)
+        # 4. Small "breathing" pause at start
         breath = AudioSegment.silent(duration=120)
         audio = breath + audio
 
-        # 6. Add ending pause
+        # 5. Ending pause
         final_audio = audio + pause_segment
 
-        # Save final MP3
         final_audio.export(audio_path, format="mp3")
 
-        # Delete temp wav
+        # cleanup temp wav
         if os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
 
@@ -2981,82 +2966,6 @@ def create_audio_segments(slides, topic_title):
         logger.debug(f"Human-enhanced audio for slide {i+1} generated at {audio_path}")
 
     return audio_paths
-
-
-# def create_audio_segments(slides, topic_title):
-#     audio_paths = []
-#     pause_segment = AudioSegment.silent(duration=350)  # small natural pause at end of each slide
-
-#     for i, slide in enumerate(slides):
-#         # For audio: title + content, but content without bullets/newlines
-#         content_for_audio = slide['content'].replace("•", " ")
-#         content_for_audio = re.sub(r'\s+', ' ', content_for_audio).strip()
-
-#         script_text = f"{slide['title']}. {content_for_audio}"
-#         if not script_text or not script_text.strip():
-#             continue
-
-#         # Auto-pause injection for MMS TTS
-#         script_text_for_tts = preprocess_text_for_tts(script_text)
-
-#         sanitized_topic = "".join(c for c in topic_title if c.isalnum())[:15]
-#         temp_wav_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}_temp.wav")
-#         audio_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_slide{i+1}_{uuid4().hex[:8]}.mp3")
-
-#         lang = detect_language(script_text_for_tts)
-#         model, tokenizer = load_model(lang)
-
-#         inputs = tokenizer(script_text_for_tts, return_tensors="pt", padding=True, truncation=True)
-#         with torch.no_grad():
-#             outputs = model(**inputs).waveform
-
-#         waveform = outputs[0].cpu().numpy()
-#         rate = model.config.sampling_rate
-
-#         # Save raw output
-#         sf.write(temp_wav_path, waveform, rate)
-
-#         # Load into pydub for humanization
-#         audio = AudioSegment.from_wav(temp_wav_path)
-
-#         # -------------------------
-#         #  HUMANIZATION PROCESSING
-#         # -------------------------
-
-#         # 1. Slight low-pass to soften harsh robotic highs
-#         # audio = audio.low_pass_filter(7000)
-
-#         # # 2. Slight pitch warmth (decrease frame rate a bit)
-#         # audio = audio._spawn(audio.raw_data, overrides={
-#         #     "frame_rate": int(audio.frame_rate * 0.94)
-#         # }).set_frame_rate(audio.frame_rate)
-
-#         # # 3. Speed normalization (slightly faster to feel natural)
-#         # try:
-#         #     audio = audio.speedup(playback_speed=1.06, chunk_size=50, crossfade=20)
-#         # except Exception as e:
-#         #     logger.warning(f"Speedup failed for slide {i+1}, using original speed: {e}")
-
-
-        
-
-#         # 4. Small "breathing" pause at start
-#         breath = AudioSegment.silent(duration=120)
-#         audio = breath + audio
-
-#         # 5. Ending pause
-#         final_audio = audio + pause_segment
-
-#         final_audio.export(audio_path, format="mp3")
-
-#         # cleanup temp wav
-#         if os.path.exists(temp_wav_path):
-#             os.remove(temp_wav_path)
-
-#         audio_paths.append(audio_path)
-#         logger.debug(f"Human-enhanced audio for slide {i+1} generated at {audio_path}")
-
-#     return audio_paths
 
 #
 # ==================================================================
@@ -3384,3 +3293,4 @@ if __name__ == '__main__':
     logger.info("--------------------")
 
     app.run(host='0.0.0.0', port=8000, debug=True, use_reloader=False)
+
