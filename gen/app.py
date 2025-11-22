@@ -3294,3 +3294,616 @@ if __name__ == '__main__':
 
     app.run(host='0.0.0.0', port=8000, debug=True, use_reloader=False)
 
+
+# # app.py
+# import os
+# import re
+# import json
+# import random
+# import logging
+# import shutil
+# import threading
+# import zipfile
+# from uuid import uuid4
+
+# from flask import Flask, request, jsonify, send_file
+# from flask_cors import CORS
+# from werkzeug.utils import secure_filename
+
+# from PIL import Image, ImageDraw, ImageFont, ImageFilter
+# import textwrap
+
+# from pydub import AudioSegment
+# import ffmpeg
+# import soundfile as sf
+# import torch
+# from transformers import VitsModel, AutoTokenizer
+
+# import google.generativeai as genai
+
+# # --------------------------
+# # Logging
+# # --------------------------
+# logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# logger = logging.getLogger(__name__)
+
+# # --------------------------
+# # Flask app + dirs
+# # --------------------------
+# app = Flask(__name__)
+# CORS(app)
+
+# OUTPUT_DIR = "output"
+# TEMP_DIR = os.path.join(OUTPUT_DIR, "temp")
+# UPLOADS_DIR = os.path.join(TEMP_DIR, "uploads")
+
+# for d in [OUTPUT_DIR, TEMP_DIR, UPLOADS_DIR]:
+#     os.makedirs(d, exist_ok=True)
+
+# # --------------------------
+# # Globals
+# # --------------------------
+# tasks = {}          # task_id -> status / paths
+# MODELS = {}         # tts models cache
+# GEMINI_API_KEY = 'AIzaSyDTZAg3luaBjvIr6UYeYL1U6z2hZ2MnCKw'
+
+# # --------------------------
+# # Utilities
+# # --------------------------
+# def slugify(name: str, max_len=40):
+#     name = name.lower()
+#     name = re.sub(r"[^\w\s-]", "", name)
+#     name = re.sub(r"\s+", "-", name).strip("-")
+#     return name[:max_len]
+
+# def safe_filename(src_path):
+#     base = os.path.basename(src_path)
+#     safe = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+#     return safe
+
+# # --------------------------
+# # 1) Gemini script generation
+# # --------------------------
+# def generate_script(topic, segments=5):
+#     if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_KEY":
+#         logger.error("GEMINI_API_KEY missing or default. Set GEMINI_API_KEY env var.")
+#         raise RuntimeError("GEMINI_API_KEY missing")
+
+#     genai.configure(api_key=GEMINI_API_KEY)
+#     model = genai.GenerativeModel("gemini-2.5-flash")
+
+#     prompt = f"""
+# You are a friendly YouTuber explaining the topic: "{topic}".
+# Create {segments} segments. Keep it conversational, simple, and helpful.
+
+# STRICT FORMAT:
+# Segment 1: [Short title]
+# Narration: [4-6 short sentences in natural spoken style]
+
+# Segment 2: [Short title]
+# Narration: [...]
+
+# RULES:
+# - Start directly; do not add greetings (no 'Welcome back').
+# - Do not add lists inside narration.
+# - Use contractions (don't, it's, you'll).
+# - Use light storytelling: words like 'Imagine', 'Picture this', 'You might notice'.
+# - No outro or summary at the end.
+# """
+#     response = model.generate_content(prompt)
+#     return response.text.strip()
+
+# # --------------------------
+# # 2) Parse Gemini output -> slides
+# # --------------------------
+# def parse_script(script_text, topic):
+#     slides = []
+#     # intro slide
+#     slides.append({
+#         "title": topic,
+#         "content": "• In this video we'll break the topic into easy steps.\n• Follow along.",
+#         "narration": f"Let's talk about {topic} in a simple and calm way. We'll go step by step."
+#     })
+
+#     parts = re.split(r"Segment \d+:", script_text, flags=re.IGNORECASE)
+#     for section in parts:
+#         lines = [l.strip() for l in section.splitlines() if l.strip()]
+#         if len(lines) < 2:
+#             continue
+#         raw_title = lines[0].replace("[", "").replace("]", "").strip()
+#         narration = ""
+#         for l in lines[1:]:
+#             if l.lower().startswith("narration:"):
+#                 narration = l[len("narration:"):].strip()
+#                 break
+#         if not narration:
+#             narration = lines[-1]
+#         # make bullets for onscreen content
+#         sentences = re.split(r"(?<=[.!?])\s+", narration)
+#         bullets = [f"• {s.strip()}" for s in sentences if s.strip()]
+#         content = "\n".join(bullets)
+#         slides.append({"title": raw_title, "content": content, "narration": narration})
+#     return slides
+
+# # --------------------------
+# # 3) TTS helpers (MMS VITS)
+# # --------------------------
+# def load_tts(lang):
+#     if lang not in MODELS:
+#         model_name = "facebook/mms-tts-hin" if lang == "hi" else "facebook/mms-tts-eng"
+#         logger.info(f"Loading TTS model: {model_name}")
+#         MODELS[lang] = {
+#             "model": VitsModel.from_pretrained(model_name),
+#             "tokenizer": AutoTokenizer.from_pretrained(model_name)
+#         }
+#     return MODELS[lang]["model"], MODELS[lang]["tokenizer"]
+
+# def preprocess_text_for_tts(text: str) -> str:
+#     text = text.replace("•", " ")
+#     text = re.sub(r"\s+", " ", text).strip()
+#     # short pause: comma; medium: " - "; long: ". ."
+#     text = text.replace(", ", ", - ")
+#     text = text.replace(". ", ". . ")
+#     text = text.replace("? ", "? . ")
+#     text = text.replace("! ", "! . ")
+#     return text
+
+# def humanize_audio(audio: AudioSegment) -> AudioSegment:
+#     # Compression
+#     try:
+#         audio = audio.compress_dynamic_range(threshold=-25.0, ratio=3.0, attack=5, release=50)
+#     except Exception:
+#         pass
+#     # EQ
+#     try:
+#         audio = audio.low_pass_filter(5500)
+#         audio = audio.high_pass_filter(120)
+#     except Exception:
+#         pass
+#     # Slight pitch warmth
+#     try:
+#         audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 0.975)}).set_frame_rate(audio.frame_rate)
+#     except Exception:
+#         pass
+#     # fade in/out
+#     audio = audio.fade_in(80).fade_out(120)
+#     return audio
+
+# def create_audio_segments(slides):
+#     audio_paths = []
+#     end_pause = AudioSegment.silent(duration=350)
+   
+#     for idx, s in enumerate(slides):
+#         narration = s.get("narration", s.get("content", ""))
+#         if not narration or not narration.strip():
+#             p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
+#             AudioSegment.silent(duration=1500).export(p, format="mp3")
+#             audio_paths.append(p)
+#             continue
+#         tts_text = preprocess_text_for_tts(narration)
+#         lang = "hi" if re.search(r"[\u0900-\u097F]", tts_text) else "en"
+#         try:
+#             model, tokenizer = load_tts(lang)
+#             inputs = tokenizer(tts_text, return_tensors="pt", padding=True, truncation=True)
+#             with torch.no_grad():
+#                 out = model(**inputs).waveform
+#             wav_path = os.path.join(TEMP_DIR, f"tts_{uuid4().hex}.wav")
+#             sf.write(wav_path, out[0].cpu().numpy(), model.config.sampling_rate)
+
+#             audio = AudioSegment.from_wav(wav_path)
+#             audio = humanize_audio(audio)
+#             audio = AudioSegment.silent(duration=120) + audio + end_pause
+
+#             mp3_path = os.path.join(TEMP_DIR, f"audio_{uuid4().hex}.mp3")
+#             audio.export(mp3_path, format="mp3")
+
+#             # cleanup
+#             try:
+#                 os.remove(wav_path)
+#             except Exception:
+#                 pass
+
+#             audio_paths.append(mp3_path)
+#         except Exception as e:
+#             logger.warning(f"TTS error for slide {idx}: {e}")
+#             p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
+#             AudioSegment.silent(duration=1500).export(p, format="mp3")
+#             audio_paths.append(p)
+#     return audio_paths
+
+# # --------------------------
+# # 4) Visual helpers (side images fixed)
+# # --------------------------
+# def get_font(size):
+#     candidates = [
+#         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+#         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+#         "/System/Library/Fonts/HelveticaNeue.ttc",
+#         os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "arial.ttf")
+#     ]
+#     for p in candidates:
+#         if p and os.path.exists(p):
+#             try:
+#                 return ImageFont.truetype(p, size)
+#             except Exception:
+#                 continue
+#     return ImageFont.load_default()
+
+# def create_slide_image(slide, side_imgs, bg_imgs, size=(1280, 720)):
+#     W, H = size
+#     # base background
+#     if bg_imgs:
+#         bg_path = random.choice(bg_imgs)
+#         bg = Image.open(bg_path).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
+#         bg = bg.filter(ImageFilter.GaussianBlur(radius=12))
+#         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 110))
+#         base = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
+#     else:
+#         base = Image.new("RGB", (W, H), (32, 34, 40))
+
+#     draw = ImageDraw.Draw(base)
+#     # text box and layout
+#     padding = 60
+#     gap = 40
+#     text_box_width = int(W * 0.6) if side_imgs else W - 2 * padding
+#     if side_imgs:
+#         # left side image region
+#         side_w = int(W * 0.35)
+#         side_h = H - 2 * padding
+#         side_x = padding
+#         side_y = padding
+#         try:
+#             side_img = Image.open(random.choice(side_imgs)).convert("RGB")
+#             # fit & crop to box
+#             img_ratio = side_img.width / side_img.height
+#             box_ratio = side_w / side_h
+#             if img_ratio > box_ratio:
+#                 # too wide -> fit height
+#                 new_h = side_h
+#                 new_w = int(new_h * img_ratio)
+#                 side_img = side_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+#                 crop_x = (new_w - side_w) // 2
+#                 side_img = side_img.crop((crop_x, 0, crop_x + side_w, new_h))
+#             else:
+#                 new_w = side_w
+#                 new_h = int(new_w / img_ratio)
+#                 side_img = side_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+#                 crop_y = (new_h - side_h) // 2
+#                 side_img = side_img.crop((0, crop_y, new_w, crop_y + side_h))
+#             # rounded mask
+#             mask = Image.new("L", (side_w, side_h), 0)
+#             mdraw = ImageDraw.Draw(mask)
+#             radius = 20
+#             mdraw.rounded_rectangle((0, 0, side_w, side_h), radius=radius, fill=255)
+#             base.paste(side_img, (side_x, side_y), mask)
+#             # optional border
+#             draw.rounded_rectangle((side_x, side_y, side_x + side_w, side_y + side_h), radius=20, outline=(255,255,255), width=2)
+#         except Exception as e:
+#             logger.debug(f"Side image error: {e}")
+
+#         text_x = side_x + side_w + gap
+#         text_box = (text_x, padding, W - padding, H - padding)
+#     else:
+#         text_box = (padding, padding, W - padding, H - padding)
+
+#     # draw white rounded rectangle
+#     draw.rounded_rectangle(text_box, radius=20, fill=(255,255,255,230))
+
+#     # write title + bullets inside text_box
+#     title = slide.get("title", "")
+#     content = slide.get("content", "")
+
+#     font_title = get_font(44)
+#     font_body = get_font(30)
+
+#     tx, ty = text_box[0] + 24, text_box[1] + 24
+#     # title wrap
+#     for line in textwrap.wrap(title, width=28):
+#         draw.text((tx, ty), line, font=font_title, fill=(0,0,0))
+#         ty += int(font_title.size * 1.05) + 6
+#     ty += 8
+#     # content (bullets)
+#     for line in content.split("\n"):
+#         for wline in textwrap.wrap(line, width=48):
+#             if ty > text_box[3] - 36:
+#                 break
+#             draw.text((tx, ty), wline, font=font_body, fill=(60,60,60))
+#             ty += int(font_body.size * 1.02) + 6
+
+#     return base.convert("RGB")
+
+# # --------------------------
+# # 5) Video & FFmpeg helpers
+# # --------------------------
+# def normalize_user_video(input_path, out_path=None):
+#     """Convert user video to 1280x720 padded, 24fps, but keep original duration."""
+#     if not out_path:
+#         out_path = os.path.join(TEMP_DIR, f"norm_{uuid4().hex}.mp4")
+#     try:
+#         (
+#             ffmpeg
+#             .input(input_path)
+#             .filter('scale', 1280, 720, force_original_aspect_ratio='decrease')
+#             .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
+#             .output(out_path, vcodec='libx264', acodec='aac', r=24, ar=44100, pix_fmt='yuv420p', strict='experimental')
+#             .global_args('-loglevel', 'error')
+#             .run(overwrite_output=True)
+#         )
+#         return out_path
+#     except Exception as e:
+#         logger.error(f"normalize_user_video error: {e}")
+#         return None
+
+# def create_intro_clip_from_user_video(user_video_path, intro_audio_path, trim_to_audio=True):
+#     """
+#     For Option B:
+#     - Trim user_video to match intro audio duration (if trim_to_audio True)
+#     - Mute user_video
+#     - Overlay intro_audio_path as audio track
+#     - Return generated clip path
+#     """
+#     try:
+#         # ensure normalized size
+#         norm_path = os.path.join(TEMP_DIR, f"norm_{uuid4().hex}.mp4")
+#         norm = normalize_user_video(user_video_path, out_path=norm_path)
+#         if not norm:
+#             return None
+
+#         # duration of TTS audio
+#         audio_dur = AudioSegment.from_file(intro_audio_path).duration_seconds
+#         if trim_to_audio:
+#             t = audio_dur
+#         else:
+#             # use full user video duration
+#             # get via ffprobe? get pydub
+#             t = AudioSegment.from_file(user_video_path).duration_seconds
+
+#         out_path = os.path.join(TEMP_DIR, f"intro_clip_{uuid4().hex}.mp4")
+#         # build streams separately
+#         vid_stream = ffmpeg.input(norm, ss=0, t=t)
+#         aud_stream = ffmpeg.input(intro_audio_path)
+#         # output: use video from user (muted), audio from intro
+#         (
+#             ffmpeg
+#             .output(vid_stream, aud_stream, out_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', r=24, shortest=None)
+#             .global_args('-loglevel', 'error')
+#             .run(overwrite_output=True)
+#         )
+#         # cleanup normalized copy
+#         try:
+#             os.remove(norm)
+#         except:
+#             pass
+#         return out_path
+#     except Exception as e:
+#         logger.error(f"create_intro_clip_from_user_video error: {e}")
+#         return None
+
+# def make_slide_video(image_path, audio_path, out_path):
+#     """
+#     Create a video from a static image and an audio file.
+#     Use separate ffmpeg inputs to avoid FilterableStream errors.
+#     """
+#     try:
+#         dur = AudioSegment.from_file(audio_path).duration_seconds
+#     except Exception:
+#         dur = None
+
+#     img_stream = ffmpeg.input(image_path, loop=1, t=dur if dur else None)
+#     aud_stream = ffmpeg.input(audio_path)
+#     (
+#         ffmpeg
+#         .output(img_stream, aud_stream, out_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', r=24)
+#         .global_args('-loglevel', 'error')
+#         .run(overwrite_output=True)
+#     )
+#     return out_path
+
+# # --------------------------
+# # 6) Task runner (main flow)
+# # --------------------------
+# def run_task(task_id, topics, side_imgs, bg_imgs, uploaded_intro_video_path=None):
+#     try:
+#         results = []
+#         # Pre-normalize intro video once if provided
+#         normalized_intro_src = None
+#         if uploaded_intro_video_path:
+#             normalized_intro_src = normalize_user_video(uploaded_intro_video_path)
+
+#         for topic in topics:
+#             logger.info(f"Processing topic: {topic}")
+#             # 1. generate script and parse
+#             script = generate_script(topic)
+#             slides = parse_script(script, topic)
+
+#             # 2. create TTS audios for all slides
+#             audios = create_audio_segments(slides)
+#             # If audios shorter than slides, fill with silence
+#             while len(audios) < len(slides):
+#                 p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
+#                 AudioSegment.silent(duration=1500).export(p, format="mp3")
+#                 audios.append(p)
+
+#             # 3. prepare intro clip (use first slide audio) -> match duration and mute
+#             intro_audio = audios[0]  # first slide narration
+#             intro_clip = None
+#             if normalized_intro_src:
+#                 intro_clip = create_intro_clip_from_user_video(normalized_intro_src, intro_audio, trim_to_audio=True)
+#             else:
+#                 # If no uploaded video, create a quick image-based intro fallback
+#                 img_intro = create_slide_image(slides[0], side_imgs, bg_imgs)
+#                 img_path = os.path.join(TEMP_DIR, f"intro_img_{uuid4().hex}.png")
+#                 img_intro.save(img_path)
+#                 intro_clip_tmp = os.path.join(TEMP_DIR, f"intro_tmp_{uuid4().hex}.mp4")
+#                 make_slide_video(img_path, intro_audio, intro_clip_tmp)
+#                 intro_clip = intro_clip_tmp
+#                 try:
+#                     os.remove(img_path)
+#                 except: pass
+
+#             # 4. make slide videos
+#             slide_vids = []
+          
+#             for i, slide in enumerate(slides):
+#                 image = create_slide_image(slide, side_imgs, bg_imgs)
+#                 img_path = os.path.join(TEMP_DIR, f"{uuid4().hex}.png")
+#                 image.save(img_path)
+#                 vid_path = os.path.join(TEMP_DIR, f"{uuid4().hex}.mp4")
+#                 make_slide_video(img_path, audios[i], vid_path)
+#                 slide_vids.append(vid_path)
+#                 # cleanup image
+#                 try:
+#                     os.remove(img_path)
+#                 except:
+#                     pass
+
+#             # 5. build final sequence: intro + slides
+#             sequence = []
+#             if intro_clip:
+#                 sequence.append(intro_clip)
+#             sequence.extend(slide_vids)
+
+#             # safe concat: move/rename clips into TEMP with safe names
+#             concat_list_path = os.path.join(TEMP_DIR, f"concat_{uuid4().hex}.txt")
+#             with open(concat_list_path, "w", encoding="utf-8") as f:
+#                 for clip in sequence:
+#                     # make safe name
+#                     raw = os.path.basename(clip)
+#                     safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
+#                     dest = os.path.join(TEMP_DIR, safe)
+#                     try:
+#                         if os.path.abspath(clip) != os.path.abspath(dest):
+#                             shutil.move(clip, dest)
+#                         else:
+#                             dest = clip
+#                     except Exception:
+#                         # fallback to copying
+#                         try:
+#                             shutil.copy2(clip, dest)
+#                         except Exception as e:
+#                             logger.warning(f"Could not move or copy clip {clip} to {dest}: {e}")
+#                     f.write(f"file {safe}\n")
+
+#             # run concat
+#             out_file = os.path.join(OUTPUT_DIR, f"{slugify(topic, 40)}_{uuid4().hex[:6]}.mp4")
+#             cwd = os.getcwd()
+#             os.chdir(TEMP_DIR)
+#             try:
+#                 (
+#                     ffmpeg
+#                     .input(os.path.basename(concat_list_path), format="concat", safe=0)
+#                     .output(os.path.join(cwd, out_file), c="copy")
+#                     .global_args("-loglevel", "error")
+#                     .run(overwrite_output=True)
+#                 )
+#             finally:
+#                 os.chdir(cwd)
+
+#             results.append(out_file)
+#             logger.info(f"Generated: {out_file}")
+
+#             # cleanup per-topic audio files
+#             for a in audios:
+#                 try:
+#                     os.remove(a)
+#                 except:
+#                     pass
+
+#             # leave final clip(s) in TEMP (they moved) — don't delete slides we moved
+#             try:
+#                 os.remove(concat_list_path)
+#             except:
+#                 pass
+
+#         # zip results
+#         zip_path = os.path.join(OUTPUT_DIR, f"{task_id}.zip")
+#         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+#             for r in results:
+#                 zf.write(r, os.path.basename(r))
+#         tasks[task_id]["status"] = "completed"
+#         tasks[task_id]["zip"] = zip_path
+#         tasks[task_id]["videos"] = results
+#         logger.info(f"Task {task_id} completed successfully.")
+#     except Exception as e:
+#         logger.exception("run_task failed")
+#         tasks[task_id]["status"] = "failed"
+#         tasks[task_id]["error"] = str(e)
+
+# # --------------------------
+# # 7) Routes
+# # --------------------------
+# @app.route("/generate-bulk-videos", methods=["POST"])
+# def generate_bulk():
+#     # topics = JSON array in form data 'topics'
+#     try:
+#         topics = json.loads(request.form.get("topics", "[]"))
+#     except Exception:
+#         return jsonify({"error": "Invalid topics format"}), 400
+
+#     # save uploaded side/bg images and uploaded intro video (single)
+#     def save_files(key):
+#         arr = []
+#         for f in request.files.getlist(key):
+#             if f and f.filename:
+#                 path = os.path.join(UPLOADS_DIR, f"{uuid4().hex}_{secure_filename(f.filename)}")
+#                 f.save(path)
+#                 arr.append(path)
+#         return arr
+
+#     side_imgs = save_files("images_side")
+#     bg_imgs = save_files("images_bg")
+#     # support single uploaded intro video field name 'intro_video'
+#     intro_videos = save_files("intro_video")
+#     uploaded_intro = intro_videos[0] if intro_videos else None
+
+#     # create task
+#     task_id = uuid4().hex
+#     tasks[task_id] = {"status": "processing"}
+#     # start background thread: every topic uses the same uploaded_intro (trimmed)
+#     threading.Thread(target=run_task, args=(task_id, topics, side_imgs, bg_imgs, uploaded_intro), daemon=True).start()
+#     return jsonify({"task_id": task_id})
+
+# @app.route("/check-status/<task_id>")
+# def check_status(task_id):
+#     return jsonify(tasks.get(task_id, {"status": "not_found"}))
+
+# @app.route("/download/<task_id>")
+# def download(task_id):
+#     t = tasks.get(task_id)
+#     if not t:
+#         return "", 404
+#     if t.get("status") != "completed":
+#         return jsonify(t), 400
+#     zip_path = t.get("zip")
+#     if not zip_path or not os.path.exists(zip_path):
+#         return "", 404
+#     return send_file(zip_path, as_attachment=True)
+
+# @app.route("/cleanup/<task_id>", methods=["POST"])
+# def cleanup(task_id):
+#     t = tasks.get(task_id)
+#     if not t:
+#         return jsonify({"status": "not_found"})
+#     # remove zip and output video files
+#     try:
+#         zipf = t.get("zip")
+#         vids = t.get("videos", [])
+#         if zipf and os.path.exists(zipf):
+#             os.remove(zipf)
+#         for v in vids:
+#             try:
+#                 os.remove(v)
+#             except:
+#                 pass
+#     except Exception as e:
+#         logger.warning(f"cleanup issue: {e}")
+#     del tasks[task_id]
+#     return jsonify({"status": "ok"})
+
+# # --------------------------
+# # 8) Run server
+# # --------------------------
+# if __name__ == "__main__":
+#     logger.info("Starting bulk video generator API...")
+#     logger.info("Make sure ffmpeg is installed and GEMINI_API_KEY is set.")
+#     app.run(host="0.0.0.0", port=8000, debug=True)
