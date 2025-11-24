@@ -3296,769 +3296,681 @@
 
 
 
-// import { useState, useEffect } from 'react';
-// import { Sparkles, Loader2, Video, CheckCircle, Download, FileImage, LayoutPanelLeft, PictureInPicture } from 'lucide-react';
-// import './App.css';
 
-// const App = () => {
-//   const [topicsText, setTopicsText] = useState('');
-//   // NEW: Two separate states for image files
-//   const [sideImageFiles, setSideImageFiles] = useState([]);
-//   const [bgImageFiles, setBgImageFiles] = useState([]); 
-  
-//   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
-//   const [videoDownloadUrl, setVideoDownloadUrl] = useState('');
-//   const [error, setError] = useState('');
-//   const [taskId, setTaskId] = useState(null);
-
-//   const serverUrl = 'http://localhost:8000'; // Your backend server URL
-
-//   // NEW: Handlers for each file input
-//   const handleSideImageChange = (e) => {
-//     setSideImageFiles(e.target.files);
-//   };
-//   const handleBgImageChange = (e) => {
-//     setBgImageFiles(e.target.files);
-//   };
-
-//   const handleGenerateVideo = async () => {
-//     const topics = topicsText.split('\n').map(t => t.trim()).filter(t => t.length > 0);
-//     if (topics.length === 0) {
-//       setError('Please paste at least one topic.');
-//       return;
-//     }
-
-//     setIsGeneratingVideo(true);
-//     setError('');
-//     setVideoDownloadUrl('');
-//     setTaskId(null);
-
-//     const formData = new FormData();
-//     formData.append('topics', JSON.stringify(topics));
-
-//     // NEW: Append both image lists separately
-//     Array.from(sideImageFiles).forEach(file => {
-//       formData.append('images_side', file); // Note the name 'images_side'
-//     });
-//     Array.from(bgImageFiles).forEach(file => {
-//       formData.append('images_bg', file); // Note the name 'images_bg'
-//     });
-
-//     try {
-//       const response = await fetch(`${serverUrl}/generate-bulk-videos`, {
-//         method: 'POST',
-//         body: formData,
-//       });
-
-//       if (!response.ok) {
-//         const errResult = await response.json();
-//         throw new Error(errResult.error || 'Failed to initiate video generation.');
-//       }
-
-//       const { task_id } = await response.json();
-//       setTaskId(task_id);
-//     } catch (err) {
-//       console.error(err);
-//       setError(`Failed to start video generation: ${err.message}`);
-//       setIsGeneratingVideo(false);
-//     }
-//   };
-
-//   // ... (useEffect for polling is unchanged) ...
-//   useEffect(() => {
-//     if (!taskId) return;
-//     const pollStatus = async () => {
-//       try {
-//         const response = await fetch(`${serverUrl}/check-status/${taskId}`);
-//         if (!response.ok) throw new Error('Failed to check status.');
-//         const task = await response.json();
-//         if (task.status === 'completed') {
-//           const downloadResponse = await fetch(`${serverUrl}/download/${taskId}`);
-//           if (!downloadResponse.ok) throw new Error('Failed to fetch zip file.');
-//           const blob = await downloadResponse.blob();
-//           const url = URL.createObjectURL(blob);
-//           setVideoDownloadUrl(url);
-//           setIsGeneratingVideo(false);
-//         } else if (task.status === 'failed') {
-//           throw new Error(task.error || 'Video generation failed.');
-//         } else {
-//           setTimeout(pollStatus, 2000);
-//         }
-//       } catch (err) {
-//         console.error(err);
-//         setError(`Error during video generation: ${err.message}`);
-//         setIsGeneratingVideo(false);
-//       }
-//     };
-//     pollStatus();
-//   }, [taskId]);
-
-//   // ... (handleDownload is unchanged) ...
-//   const handleDownload = async () => {
-//     try {
-//       await fetch(`${serverUrl}/cleanup/${taskId}`, { method: 'POST' });
-//       setTimeout(() => {
-//         URL.revokeObjectURL(videoDownloadUrl);
-//         setVideoDownloadUrl('');
-//         setTaskId(null);
-//       }, 1000);
-//     } catch (err) {
-//       console.error('Cleanup failed:', err);
-//     }
-//   };
-
-//   return (
-//     <div className="min-h-screen bg-gray-900 text-gray-100 p-8 flex flex-col items-center">
-//       <div className="w-full max-w-4xl bg-gray-800 rounded-3xl shadow-xl p-8 md:p-12 space-y-8">
-//         <header className="flex flex-col items-center text-center space-y-4">
-//           <Sparkles className="w-16 h-16 text-sky-400 animate-pulse" />
-//           <h1 className="text-4xl md:text-5xl font-extrabold text-white">Bulk Video Generator</h1>
-//           <p className="text-lg text-gray-400 max-w-2xl">
-//             Upload images for the slides and for the background/breaks.
-//           </p>
-//         </header>
-
-//         <main className="space-y-6">
-//           <div className="space-y-4">
-//             {/* --- 1. Topics Textarea --- */}
-//             <label htmlFor="topics-input" className="block text-sm font-medium text-gray-300">
-//               1. Paste Your Topics
-//             </label>
-//             <textarea
-//               id="topics-input"
-//               value={topicsText}
-//               onChange={(e) => setTopicsText(e.target.value)}
-//               placeholder="e.g.&#10;How to brew coffee at home&#10;The history of AI"
-//               rows={6}
-//               className="w-full p-4 bg-gray-700 text-white rounded-xl border border-gray-600 focus:border-sky-400 focus:ring-1 focus:ring-sky-400"
-//               disabled={isGeneratingVideo}
-//             />
-
-//             {/* --- 2. NEW: Side-by-Side Image Upload --- */}
-//             <label className="block text-sm font-medium text-gray-300">
-//               2. Upload Side-by-Side Images (Optional)
-//             </label>
-//             <label
-//               htmlFor="side-image-upload"
-//               className={`relative flex w-full justify-center p-4 bg-gray-700 text-white rounded-xl border-2 border-dashed border-gray-600 cursor-pointer
-//                 ${isGeneratingVideo ? 'opacity-50 cursor-not-allowed' : 'hover:border-sky-400'}
-//               `}
-//             >
-//               <input
-//                 id="side-image-upload"
-//                 type="file"
-//                 multiple
-//                 accept="image/*"
-//                 onChange={handleSideImageChange}
-//                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-//                 disabled={isGeneratingVideo}
-//               />
-//               <div className="flex flex-col items-center space-y-2 text-gray-400">
-//                 <LayoutPanelLeft className="w-8 h-8" />
-//                 {sideImageFiles.length > 0 ? (
-//                   <span className="font-semibold text-sky-300">{sideImageFiles.length} images selected</span>
-//                 ) : (
-//                   <span>Upload images for the slides</span>
-//                 )}
-//               </div>
-//             </label>
-
-//             {/* --- 3. NEW: Background Image Upload --- */}
-//             <label className="block text-sm font-medium text-gray-300">
-//               3. Upload Background/Break Images (Optional)
-//             </label>
-//             <label
-//               htmlFor="bg-image-upload"
-//               className={`relative flex w-full justify-center p-4 bg-gray-700 text-white rounded-xl border-2 border-dashed border-gray-600 cursor-pointer
-//                 ${isGeneratingVideo ? 'opacity-50 cursor-not-allowed' : 'hover:border-sky-400'}
-//               `}
-//             >
-//               <input
-//                 id="bg-image-upload"
-//                 type="file"
-//                 multiple
-//                 accept="image/*"
-//                 onChange={handleBgImageChange}
-//                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-//                 disabled={isGeneratingVideo}
-//               />
-//               <div className="flex flex-col items-center space-y-2 text-gray-400">
-//                 <PictureInPicture className="w-8 h-8" />
-//                 {bgImageFiles.length > 0 ? (
-//                   <span className="font-semibold text-sky-300">{bgImageFiles.length} images selected</span>
-//                 ) : (
-//                   <span>Upload images for background & breaks</span>
-//                 )}
-//               </div>
-//             </label>
-//           </div>
-
-//           {/* --- 4. Generate Button --- */}
-//           <button
-//             onClick={handleGenerateVideo}
-//             className={`w-full py-4 px-6 rounded-xl font-bold text-white transition
-//               ${isGeneratingVideo ? 'bg-indigo-600 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600'}
-//               ${!topicsText ? 'opacity-50 cursor-not-allowed' : ''}`}
-//             disabled={!topicsText || isGeneratingVideo}
-//           >
-//             {isGeneratingVideo ? (
-//               <span className="flex items-center justify-center">
-//                 <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Generating Videos...
-//               </span>
-//             ) : (
-//               <span className="flex items-center justify-center">
-//                 <Video className="mr-2 h-5 w-5" /> Generate Videos
-//               </span>
-//             )}
-//           </button>
-
-//           {/* ... (Error and Download sections are unchanged) ... */}
-//           {error && (
-//             <div className="bg-red-500 bg-opacity-20 text-red-300 p-4 rounded-xl border border-red-500 text-sm">
-//               <p>{error}</p>
-//             </div>
-//           )}
-//         </main>
-
-//         {videoDownloadUrl && !isGeneratingVideo && (
-//           <div className="mt-6">
-//             <div className="bg-emerald-500 bg-opacity-20 text-emerald-300 p-4 rounded-xl border border-emerald-500 text-sm flex items-center space-x-2">
-//               <CheckCircle size={20} />
-//               <p>All videos are ready and compressed into a single zip file.</p>
-//             </div>
-//             <a
-//               href={videoDownloadUrl}
-//               download="generated_videos.zip"
-//               className="mt-4 w-full py-4 px-6 rounded-xl font-bold text-white flex items-center justify-center bg-emerald-500 hover:bg-emerald-600"
-//               onClick={handleDownload}
-//             >
-//               <Download className="mr-2 h-5 w-5" /> Download Zip File
-//             </a>
-//           </div>
-//         )}
-//       </div>
-//     </div>
-//   );
-// };
-
-// export default App;
-
-
-// import React, { useState, useEffect } from 'react';
-// import { 
-//   Sparkles, Loader2, Video, Download, 
-//   LayoutPanelLeft, PictureInPicture, PlayCircle, SkipForward
-// } from 'lucide-react';
-// import './App.css';
-
-// const App = () => {
-//   // --- STATE ---
-//   const [topicsText, setTopicsText] = useState('');
-//   const [sideImageFiles, setSideImageFiles] = useState([]);
-//   const [bgImageFiles, setBgImageFiles] = useState([]); 
-  
-//   // Videos (NO middle video)
-//   const [startVideoFiles, setStartVideoFiles] = useState([]);
-//   const [endVideoFiles, setEndVideoFiles] = useState([]);
-
-//   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
-//   const [videoDownloadUrl, setVideoDownloadUrl] = useState('');
-//   const [error, setError] = useState('');
-//   const [taskId, setTaskId] = useState(null);
-//   const [statusMessage, setStatusMessage] = useState('Initializing...');
-
-//   const serverUrl = 'http://localhost:8000'; 
-
-//   // --- API CALL ---
-//   const handleGenerateVideo = async () => {
-//     const topics = topicsText
-//       .split('\n')
-//       .map(t => t.trim())
-//       .filter(t => t.length > 0);
-
-//     if (topics.length === 0) {
-//       setError('Please paste at least one topic.');
-//       return;
-//     }
-
-//     setIsGeneratingVideo(true);
-//     setError('');
-//     setVideoDownloadUrl('');
-//     setTaskId(null);
-//     setStatusMessage('Uploading assets...');
-
-//     const formData = new FormData();
-//     formData.append('topics', JSON.stringify(topics));
-
-//     // Append Images
-//     Array.from(sideImageFiles).forEach(file =>
-//       formData.append('images_side', file)
-//     );
-//     Array.from(bgImageFiles).forEach(file =>
-//       formData.append('images_bg', file)
-//     );
-
-//     // Append Videos (backend expects single)
-//     if (startVideoFiles.length > 0)
-//       formData.append('start_video', startVideoFiles[0]);
-
-//     if (endVideoFiles.length > 0)
-//       formData.append('end_video', endVideoFiles[0]);
-
-//     try {
-//       const response = await fetch(`${serverUrl}/generate-bulk-videos`, {
-//         method: 'POST',
-//         body: formData,
-//       });
-
-//       if (!response.ok) throw new Error('Failed to start.');
-
-//       const { task_id } = await response.json();
-//       setTaskId(task_id);
-//       setStatusMessage('Queued for processing...');
-//     } catch (err) {
-//       setError(err.message);
-//       setIsGeneratingVideo(false);
-//     }
-//   };
-
-//   // --- POLLING ---
-//   useEffect(() => {
-//     if (!taskId) return;
-
-//     const pollStatus = async () => {
-//       try {
-//         const response = await fetch(`${serverUrl}/check-status/${taskId}`);
-//         const task = await response.json();
-        
-//         if (task.status === 'completed') {
-//           setStatusMessage('Downloading...');
-//           const dl = await fetch(`${serverUrl}/download/${taskId}`);
-//           const blob = await dl.blob();
-//           setVideoDownloadUrl(URL.createObjectURL(blob));
-//           setIsGeneratingVideo(false);
-//         } 
-//         else if (task.status === 'failed') {
-//           throw new Error(task.error || 'Failed');
-//         } 
-//         else {
-//           setStatusMessage('AI is generating script, audio and video...');
-//           setTimeout(pollStatus, 3000);
-//         }
-//       } catch (err) {
-//         setError(err.message);
-//         setIsGeneratingVideo(false);
-//       }
-//     };
-
-//     pollStatus();
-//   }, [taskId]);
-
-//   return (
-//     <div className="min-h-screen bg-gray-900 text-gray-100 p-4 md:p-8 flex flex-col items-center font-sans">
-//       <div className="w-full max-w-5xl bg-gray-800 rounded-3xl shadow-2xl p-6 md:p-10 space-y-8 border border-gray-700">
-        
-//         <header className="flex flex-col items-center text-center space-y-3">
-//           <div className="p-3 bg-gray-700 rounded-full shadow-inner">
-//             <Sparkles className="w-12 h-12 text-indigo-400 animate-pulse" />
-//           </div>
-//           <h1 className="text-3xl md:text-5xl font-extrabold text-white tracking-tight">
-//             AI Video Generator
-//           </h1>
-//           <p className="text-gray-400">Create High-Quality Auto-Generated Videos</p>
-//         </header>
-
-//         <main className="space-y-8">
-
-//           {/* TOPICS INPUT */}
-//           <div className="space-y-3">
-//             <label className="text-sm font-semibold text-indigo-300 uppercase">
-//               1. Topics
-//             </label>
-//             <textarea
-//               value={topicsText}
-//               onChange={(e) => setTopicsText(e.target.value)}
-//               placeholder="Enter one topic per line..."
-//               rows={5}
-//               className="w-full p-4 bg-gray-900 text-white rounded-xl border border-gray-700"
-//               disabled={isGeneratingVideo}
-//             />
-//           </div>
-
-//           {/* IMAGES */}
-//           <div className="space-y-3">
-//             <span className="text-sm font-semibold text-indigo-300 uppercase">
-//               2. Upload Images
-//             </span>
-
-//             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-//               {/* SIDE IMAGES */}
-//               <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
-//                                 flex flex-col items-center cursor-pointer">
-//                 <input 
-//                   type="file" 
-//                   multiple 
-//                   accept="image/*" 
-//                   onChange={(e) => setSideImageFiles(e.target.files)} 
-//                   className="hidden" 
-//                   disabled={isGeneratingVideo} 
-//                 />
-//                 <LayoutPanelLeft className="w-8 h-8 text-gray-400 mb-2" />
-//                 <span>Side Images ({sideImageFiles.length})</span>
-//               </label>
-
-//               {/* BACKGROUND IMAGES */}
-//               <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
-//                                 flex flex-col items-center cursor-pointer">
-//                 <input 
-//                   type="file" 
-//                   multiple 
-//                   accept="image/*" 
-//                   onChange={(e) => setBgImageFiles(e.target.files)} 
-//                   className="hidden" 
-//                   disabled={isGeneratingVideo} 
-//                 />
-//                 <PictureInPicture className="w-8 h-8 text-gray-400 mb-2" />
-//                 <span>Backgrounds ({bgImageFiles.length})</span>
-//               </label>
-//             </div>
-//           </div>
-
-//           {/* VIDEOS */}
-//           <div className="space-y-3">
-//             <span className="text-sm font-semibold text-indigo-300 uppercase">
-//               3. Videos (Intro + End)
-//             </span>
-
-//             <div className="grid grid-cols-2 gap-4">
-
-//               {/* START VIDEO */}
-//               <label className="p-4 bg-gray-700/30 rounded-xl border border-gray-600 
-//                                 flex flex-col items-center cursor-pointer">
-//                 <input 
-//                   type="file" 
-//                   accept="video/*"
-//                   onChange={(e) => setStartVideoFiles(e.target.files)}
-//                   className="hidden"
-//                   disabled={isGeneratingVideo}
-//                 />
-//                 <PlayCircle className="w-8 h-8 text-emerald-500 mb-2" />
-//                 <span className="text-xs font-bold text-emerald-200">Intro Video</span>
-//                 <span className="text-xs text-gray-500">
-//                   {startVideoFiles[0]?.name?.slice(0,15) || 'None'}
-//                 </span>
-//               </label>
-
-//               {/* END VIDEO */}
-//               <label className="p-4 bg-gray-700/30 rounded-xl border border-gray-600 
-//                                 flex flex-col items-center cursor-pointer">
-//                 <input 
-//                   type="file" 
-//                   accept="video/*"
-//                   onChange={(e) => setEndVideoFiles(e.target.files)}
-//                   className="hidden"
-//                   disabled={isGeneratingVideo}
-//                 />
-//                 <SkipForward className="w-8 h-8 text-rose-500 mb-2" />
-//                 <span className="text-xs font-bold text-rose-200">End Video</span>
-//                 <span className="text-xs text-gray-500">
-//                   {endVideoFiles[0]?.name?.slice(0,15) || 'None'}
-//                 </span>
-//               </label>
-
-//             </div>
-//           </div>
-
-//           {/* BUTTON */}
-//           <button
-//             onClick={handleGenerateVideo}
-//             disabled={!topicsText || isGeneratingVideo}
-//             className="w-full py-5 rounded-xl font-bold text-lg text-white 
-//                        bg-indigo-600 hover:bg-indigo-500 
-//                        shadow-lg flex items-center justify-center gap-2"
-//           >
-//             {isGeneratingVideo ? (
-//               <>
-//                 <Loader2 className="animate-spin" /> 
-//                 {statusMessage}
-//               </>
-//             ) : (
-//               <>
-//                 <Video /> Generate Videos
-//               </>
-//             )}
-//           </button>
-
-//           {/* ERROR */}
-//           {error && (
-//             <div className="p-4 bg-red-500/10 text-red-200 rounded-xl text-center">
-//               {error}
-//             </div>
-//           )}
-
-//           {/* DOWNLOAD */}
-//           {videoDownloadUrl && !isGeneratingVideo && (
-//             <a
-//               href={videoDownloadUrl}
-//               download="videos.zip"
-//               className="block w-full py-4 bg-emerald-600 text-white font-bold 
-//                          rounded-xl text-center flex items-center justify-center gap-2"
-//             >
-//               <Download /> Download Zip
-//             </a>
-//           )}
-//         </main>
-//       </div>
-//     </div>
-//   );
-// };
-
-// export default App;
-
-
-import React, { useState, useEffect } from 'react';
-import { 
-  Sparkles, Loader2, Video, Download, 
-  LayoutPanelLeft, PictureInPicture, PlayCircle
-} from 'lucide-react';
-import './App.css';
-
-const App = () => {
-  // --- STATE ---
-  const [topicsText, setTopicsText] = useState('');
-  const [sideImageFiles, setSideImageFiles] = useState([]);
-  const [bgImageFiles, setBgImageFiles] = useState([]); 
-  
-  // Intro Video (Only ONE video used for all topics)
-  const [introVideoFiles, setIntroVideoFiles] = useState([]);
-
-  const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
-  const [videoDownloadUrl, setVideoDownloadUrl] = useState('');
-  const [error, setError] = useState('');
-  const [taskId, setTaskId] = useState(null);
-  const [statusMessage, setStatusMessage] = useState('Initializing...');
-
-  const serverUrl = 'http://localhost:8000'; 
-
-  // --- API CALL ---
-  const handleGenerateVideo = async () => {
-    const topics = topicsText
-      .split('\n')
-      .map(t => t.trim())
-      .filter(t => t.length > 0);
-
-    if (topics.length === 0) {
-      setError('Please enter at least one topic.');
-      return;
-    }
-
-    setIsGeneratingVideo(true);
-    setError('');
-    setVideoDownloadUrl('');
-    setTaskId(null);
-    setStatusMessage('Uploading assets...');
-
-    const formData = new FormData();
-    formData.append('topics', JSON.stringify(topics));
-
-    // Append Images
-    Array.from(sideImageFiles).forEach(file =>
-      formData.append('images_side', file)
-    );
-    Array.from(bgImageFiles).forEach(file =>
-      formData.append('images_bg', file)
-    );
-
-    // Append INTRO VIDEO (IMPORTANT FIX)
-    if (introVideoFiles.length > 0) {
-      formData.append('intro_video', introVideoFiles[0]);  // <-- FIXED
-    }
-
-    try {
-      const response = await fetch(`${serverUrl}/generate-bulk-videos`, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error('Failed to start generation.');
-
-      const { task_id } = await response.json();
-      setTaskId(task_id);
-      setStatusMessage('Queued for processing...');
-    } catch (err) {
-      setError(err.message);
-      setIsGeneratingVideo(false);
-    }
-  };
-
-  // --- POLLING ---
-  useEffect(() => {
-    if (!taskId) return;
-
-    const pollStatus = async () => {
-      try {
-        const response = await fetch(`${serverUrl}/check-status/${taskId}`);
-        const task = await response.json();
-        
-        if (task.status === 'completed') {
-          setStatusMessage('Downloading results...');
-          const dl = await fetch(`${serverUrl}/download/${taskId}`);
-          const blob = await dl.blob();
-          setVideoDownloadUrl(URL.createObjectURL(blob));
-          setIsGeneratingVideo(false);
-        } 
-        else if (task.status === 'failed') {
-          throw new Error(task.error || 'Failed');
-        } 
-        else {
-          setStatusMessage('AI is generating script, audio, and video...');
-          setTimeout(pollStatus, 3000);
+# app.py
+import os
+import re
+import json
+import random
+import logging
+import shutil
+import threading
+import zipfile
+from uuid import uuid4
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import textwrap
+
+from pydub import AudioSegment
+import ffmpeg
+import soundfile as sf
+import torch
+from transformers import VitsModel, AutoTokenizer
+
+import google.generativeai as genai
+
+# --------------------------
+# Logging
+# --------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# --------------------------
+# Flask app + dirs
+# --------------------------
+app = Flask(__name__)
+CORS(app)
+
+OUTPUT_DIR = "output"
+TEMP_DIR = os.path.join(OUTPUT_DIR, "temp")
+UPLOADS_DIR = os.path.join(TEMP_DIR, "uploads")
+
+for d in [OUTPUT_DIR, TEMP_DIR, UPLOADS_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# --------------------------
+# Globals
+# --------------------------
+tasks = {}          # task_id -> status / paths
+MODELS = {}         # tts models cache
+GEMINI_API_KEY = 'AIzaSyCkS_Na4BbkaNsHGBJQsUyVw6yfIDbA2Go'  # keep your key here or set env var
+
+# --------------------------
+# Utilities
+# --------------------------
+def slugify(name: str, max_len=40):
+    name = name.lower()
+    name = re.sub(r"[^\w\s-]", "", name)
+    name = re.sub(r"\s+", "-", name).strip("-")
+    return name[:max_len]
+
+def safe_filename(src_path):
+    base = os.path.basename(src_path)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return safe
+
+# --------------------------
+# 1) Gemini script generation (FINAL PROMPT: intro-only paragraph then segments)
+# --------------------------
+def generate_script(topic, segments=5):
+    """
+    Prompt: produce Segment 1 as ONLY an intro paragraph (no labels/titles),
+    matching the example style and length, then Segments 2..N with title+narration.
+    """
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_KEY":
+        logger.error("GEMINI_API_KEY missing or default. Set GEMINI_API_KEY env var.")
+        raise RuntimeError("GEMINI_API_KEY missing")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+
+    prompt = f"""
+You are a storyteller YouTuber.
+
+------------------------------------------
+🔥 WRITE SEGMENT 1 AS A PURE INTRO PARAGRAPH ONLY
+------------------------------------------
+
+FORMAT & STYLE MUST MATCH THIS EXACT EXAMPLE STYLE:
+
+"Is your iPhone camera giving you a hard time? Don't worry; you're not alone.
+Many iPhone users encounter camera issues, such as black screens, unresponsive apps, or cameras simply not working. These problems can be frustrating, especially when capturing important moments or taking stunning photos. But fear not! We will explore various troubleshooting tips and solutions to help you fix your iPhone camera issues and get back to capturing memories in no time."
+
+STRICT RULES FOR SEGMENT 1:
+- NO title
+- NO "Segment 1"
+- NO "Narration:"
+- NO lists
+- NO bullet points
+- NO headings
+- NO outro
+- Must look EXACTLY like a real YouTube intro paragraph
+- Emotional and cinematic
+- Relatable frustration about "{topic}"
+- Reassurance tone
+- Explain what viewers will learn
+- 8 to 12 sentences total
+- Sentence structure should be similar to the example:
+    • Line 1: 2 short sentences  
+    • Line 2: 3–4 medium sentences  
+    • Line 3: 2–3 sentences  
+- Insert line breaks similar to the example:
+    Sentence1. Sentence2.
+    Sentence3. Sentence4. Sentence5.
+    Sentence6. Sentence7.
+
+------------------------------------------
+🔥 AFTER THE INTRO, WRITE SEGMENTS 2–{segments} NORMALLY:
+------------------------------------------
+
+Segment 2: [Short title]
+Narration: [3–5 natural, spoken-style sentences]
+
+Segment 3: [Short title]
+Narration: [3–5 natural, spoken-style sentences]
+
+Segment 4: [Short title]
+Narration: [3–5 natural, spoken-style sentences]
+
+Segment 5: [Short title]
+Narration: [3–5 natural, spoken-style sentences]
+
+RULES FOR SEGMENTS 2–{segments}:
+- No lists
+- No bullets
+- No greetings
+- No outro
+- Only title + narration
+
+Do not add anything outside this format.
+"""
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini script error: {e}")
+        raise RuntimeError(f"Script generation failed: {e}")
+
+# --------------------------
+# 2) Parse Gemini output -> slides
+# --------------------------
+def parse_script(script_text, topic):
+    slides = []
+    # intro slide (fallback content for slide-0)
+    slides.append({
+        "title": topic,
+        "content": "• In this video we'll break the topic into easy steps.\n• Follow along.",
+        "narration": f"Let's talk about {topic} in a simple and calm way. We'll go step by step."
+    })
+
+    parts = re.split(r"Segment \d+:", script_text, flags=re.IGNORECASE)
+    for section in parts:
+        lines = [l.strip() for l in section.splitlines() if l.strip()]
+        if len(lines) < 2:
+            continue
+        raw_title = lines[0].replace("[", "").replace("]", "").strip()
+        narration = ""
+        for l in lines[1:]:
+            if l.lower().startswith("narration:"):
+                narration = l[len("narration:"):].strip()
+                break
+        if not narration:
+            narration = lines[-1]
+        # make bullets for onscreen content
+        sentences = re.split(r"(?<=[.!?])\s+", narration)
+        bullets = [f"• {s.strip()}" for s in sentences if s.strip()]
+        content = "\n".join(bullets)
+        slides.append({"title": raw_title, "content": content, "narration": narration})
+    return slides
+
+# --------------------------
+# 3) TTS helpers (MMS VITS)
+# --------------------------
+def load_tts(lang):
+    if lang not in MODELS:
+        model_name = "facebook/mms-tts-hin" if lang == "hi" else "facebook/mms-tts-eng"
+        logger.info(f"Loading TTS model: {model_name}")
+        MODELS[lang] = {
+            "model": VitsModel.from_pretrained(model_name),
+            "tokenizer": AutoTokenizer.from_pretrained(model_name)
         }
-      } catch (err) {
-        setError(err.message);
-        setIsGeneratingVideo(false);
-      }
-    };
+    return MODELS[lang]["model"], MODELS[lang]["tokenizer"]
 
-    pollStatus();
-  }, [taskId]);
+def preprocess_text_for_tts(text: str) -> str:
+    text = text.replace("•", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    # insert light markers for natural pauses
+    text = text.replace(", ", ", - ")
+    text = text.replace(". ", ". . ")
+    text = text.replace("? ", "? . ")
+    text = text.replace("! ", "! . ")
+    return text
 
-  return (
-    <div className="min-h-screen bg-gray-900 text-gray-100 p-4 md:p-8 flex flex-col items-center font-sans">
-      <div className="w-full max-w-5xl bg-gray-800 rounded-3xl shadow-2xl p-6 md:p-10 space-y-8 border border-gray-700">
-        
-        <header className="flex flex-col items-center text-center space-y-3">
-          <div className="p-3 bg-gray-700 rounded-full shadow-inner">
-            <Sparkles className="w-12 h-12 text-indigo-400 animate-pulse" />
-          </div>
-          <h1 className="text-3xl md:text-5xl font-extrabold text-white tracking-tight">
-            AI Bulk Video Generator
-          </h1>
-          <p className="text-gray-400">Create High-Quality Auto-Generated Videos</p>
-        </header>
+def humanize_audio(audio: AudioSegment) -> AudioSegment:
+    # Compression
+    try:
+        audio = audio.compress_dynamic_range(threshold=-25.0, ratio=3.0, attack=5, release=50)
+    except Exception:
+        pass
+    # EQ
+    try:
+        audio = audio.low_pass_filter(5500)
+        audio = audio.high_pass_filter(120)
+    except Exception:
+        pass
+    # Slight pitch warmth
+    try:
+        audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 0.975)}).set_frame_rate(audio.frame_rate)
+    except Exception:
+        pass
+    # fade in/out
+    audio = audio.fade_in(80).fade_out(120)
+    return audio
 
-        <main className="space-y-8">
+def create_audio_segments(slides):
+    audio_paths = []
+    end_pause = AudioSegment.silent(duration=350)
+   
+    for idx, s in enumerate(slides):
+        narration = s.get("narration", s.get("content", ""))
+        if not narration or not narration.strip():
+            p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
+            AudioSegment.silent(duration=1500).export(p, format="mp3")
+            audio_paths.append(p)
+            continue
+        tts_text = preprocess_text_for_tts(narration)
+        lang = "hi" if re.search(r"[\u0900-\u097F]", tts_text) else "en"
+        try:
+            model, tokenizer = load_tts(lang)
+            inputs = tokenizer(tts_text, return_tensors="pt", padding=True, truncation=True)
+            with torch.no_grad():
+                out = model(**inputs).waveform
+            wav_path = os.path.join(TEMP_DIR, f"tts_{uuid4().hex}.wav")
+            sf.write(wav_path, out[0].cpu().numpy(), model.config.sampling_rate)
 
-          {/* TOPICS INPUT */}
-          <div className="space-y-3">
-            <label className="text-sm font-semibold text-indigo-300 uppercase">
-              1. Topics
-            </label>
-            <textarea
-              value={topicsText}
-              onChange={(e) => setTopicsText(e.target.value)}
-              placeholder="Enter one topic per line..."
-              rows={5}
-              className="w-full p-4 bg-gray-900 text-white rounded-xl border border-gray-700"
-              disabled={isGeneratingVideo}
-            />
-          </div>
+            audio = AudioSegment.from_wav(wav_path)
+            audio = humanize_audio(audio)
+            audio = AudioSegment.silent(duration=120) + audio + end_pause
 
-          {/* IMAGES */}
-          <div className="space-y-3">
-            <span className="text-sm font-semibold text-indigo-300 uppercase">
-              2. Upload Images
-            </span>
+            mp3_path = os.path.join(TEMP_DIR, f"audio_{uuid4().hex}.mp3")
+            audio.export(mp3_path, format="mp3")
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* SIDE IMAGES */}
-              <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
-                                flex flex-col items-center cursor-pointer">
-                <input 
-                  type="file" 
-                  multiple 
-                  accept="image/*" 
-                  onChange={(e) => setSideImageFiles(e.target.files)} 
-                  className="hidden" 
-                  disabled={isGeneratingVideo} 
-                />
-                <LayoutPanelLeft className="w-8 h-8 text-gray-400 mb-2" />
-                <span>Side Images ({sideImageFiles.length})</span>
-              </label>
+            # cleanup
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
-              {/* BACKGROUND IMAGES */}
-              <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
-                                flex flex-col items-center cursor-pointer">
-                <input 
-                  type="file" 
-                  multiple 
-                  accept="image/*" 
-                  onChange={(e) => setBgImageFiles(e.target.files)} 
-                  className="hidden" 
-                  disabled={isGeneratingVideo} 
-                />
-                <PictureInPicture className="w-8 h-8 text-gray-400 mb-2" />
-                <span>Backgrounds ({bgImageFiles.length})</span>
-              </label>
-            </div>
-          </div>
+            audio_paths.append(mp3_path)
+        except Exception as e:
+            logger.warning(f"TTS error for slide {idx}: {e}")
+            p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
+            AudioSegment.silent(duration=1500).export(p, format="mp3")
+            audio_paths.append(p)
+    return audio_paths
 
-          {/* INTRO VIDEO */}
-          <div className="space-y-3">
-            <span className="text-sm font-semibold text-indigo-300 uppercase">
-              3. Intro Video (Used For Every Topic)
-            </span>
+# --------------------------
+# 4) Visual helpers (side images fixed)
+# --------------------------
+def get_font(size):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "arial.ttf")
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
 
-            <label className="p-4 bg-gray-700/30 rounded-xl border border-gray-600 
-                              flex flex-col items-center cursor-pointer">
-              <input 
-                type="file" 
-                accept="video/*"
-                onChange={(e) => setIntroVideoFiles(e.target.files)}
-                className="hidden"
-                disabled={isGeneratingVideo}
-              />
-              <PlayCircle className="w-8 h-8 text-emerald-500 mb-2" />
-              <span className="text-xs font-bold text-emerald-200">Intro Video</span>
-              <span className="text-xs text-gray-500">
-                {introVideoFiles[0]?.name?.slice(0,25) || 'None'}
-              </span>
-            </label>
-          </div>
+def create_slide_image(slide, side_imgs, bg_imgs, size=(1280, 720)):
+    W, H = size
+    # base background
+    if bg_imgs:
+        bg_path = random.choice(bg_imgs)
+        bg = Image.open(bg_path).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=12))
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 110))
+        base = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
+    else:
+        base = Image.new("RGB", (W, H), (32, 34, 40))
 
-          {/* GENERATE BUTTON */}
-          <button
-            onClick={handleGenerateVideo}
-            disabled={!topicsText || isGeneratingVideo}
-            className="w-full py-5 rounded-xl font-bold text-lg text-white 
-                       bg-indigo-600 hover:bg-indigo-500 
-                       shadow-lg flex items-center justify-center gap-2"
-          >
-            {isGeneratingVideo ? (
-              <>
-                <Loader2 className="animate-spin" /> 
-                {statusMessage}
-              </>
-            ) : (
-              <>
-                <Video /> Generate Videos
-              </>
-            )}
-          </button>
+    draw = ImageDraw.Draw(base)
+    # text box and layout
+    padding = 60
+    gap = 40
+    text_box_width = int(W * 0.6) if side_imgs else W - 2 * padding
+    if side_imgs:
+        # left side image region
+        side_w = int(W * 0.35)
+        side_h = H - 2 * padding
+        side_x = padding
+        side_y = padding
+        try:
+            side_img = Image.open(random.choice(side_imgs)).convert("RGB")
+            # fit & crop to box
+            img_ratio = side_img.width / side_img.height
+            box_ratio = side_w / side_h
+            if img_ratio > box_ratio:
+                # too wide -> fit height
+                new_h = side_h
+                new_w = int(new_h * img_ratio)
+                side_img = side_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                crop_x = (new_w - side_w) // 2
+                side_img = side_img.crop((crop_x, 0, crop_x + side_w, new_h))
+            else:
+                new_w = side_w
+                new_h = int(new_w / img_ratio)
+                side_img = side_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                crop_y = (new_h - side_h) // 2
+                side_img = side_img.crop((0, crop_y, new_w, crop_y + side_h))
+            # rounded mask
+            mask = Image.new("L", (side_w, side_h), 0)
+            mdraw = ImageDraw.Draw(mask)
+            radius = 20
+            mdraw.rounded_rectangle((0, 0, side_w, side_h), radius=radius, fill=255)
+            base.paste(side_img, (side_x, side_y), mask)
+            # optional border
+            draw.rounded_rectangle((side_x, side_y, side_x + side_w, side_y + side_h), radius=20, outline=(255,255,255), width=2)
+        except Exception as e:
+            logger.debug(f"Side image error: {e}")
 
-          {/* ERROR */}
-          {error && (
-            <div className="p-4 bg-red-500/10 text-red-200 rounded-xl text-center">
-              {error}
-            </div>
-          )}
+        text_x = side_x + side_w + gap
+        text_box = (text_x, padding, W - padding, H - padding)
+    else:
+        text_box = (padding, padding, W - padding, H - padding)
 
-          {/* DOWNLOAD BUTTON */}
-          {videoDownloadUrl && !isGeneratingVideo && (
-            <a
-              href={videoDownloadUrl}
-              download="generated_videos.zip"
-              className="block w-full py-4 bg-emerald-600 text-white font-bold 
-                         rounded-xl text-center flex items-center justify-center gap-2"
-            >
-              <Download /> Download Zip
-            </a>
-          )}
+    # draw white rounded rectangle
+    draw.rounded_rectangle(text_box, radius=20, fill=(255,255,255,230))
 
-        </main>
-      </div>
-    </div>
-  );
-};
+    # write title + bullets inside text_box
+    title = slide.get("title", "")
+    content = slide.get("content", "")
 
-export default App;
+    font_title = get_font(44)
+    font_body = get_font(30)
+
+    tx, ty = text_box[0] + 24, text_box[1] + 24
+    # title wrap
+    for line in textwrap.wrap(title, width=28):
+        draw.text((tx, ty), line, font=font_title, fill=(0,0,0))
+        ty += int(font_title.size * 1.05) + 6
+    ty += 8
+    # content (bullets)
+    for line in content.split("\n"):
+        for wline in textwrap.wrap(line, width=48):
+            if ty > text_box[3] - 36:
+                break
+            draw.text((tx, ty), wline, font=font_body, fill=(60,60,60))
+            ty += int(font_body.size * 1.02) + 6
+
+    return base.convert("RGB")
+
+# --------------------------
+# 5) Video & FFmpeg helpers
+# --------------------------
+def normalize_user_video(input_path, out_path=None):
+    """Convert user video to 1280x720 padded, 24fps, but keep original duration."""
+    if not out_path:
+        out_path = os.path.join(TEMP_DIR, f"norm_{uuid4().hex}.mp4")
+    try:
+        (
+            ffmpeg
+            .input(input_path)
+            .filter('scale', 1280, 720, force_original_aspect_ratio='decrease')
+            .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
+            .output(out_path, vcodec='libx264', acodec='aac', r=24, ar=44100, pix_fmt='yuv420p', strict='experimental')
+            .global_args('-loglevel', 'error')
+            .run(overwrite_output=True)
+        )
+        return out_path
+    except Exception as e:
+        logger.error(f"normalize_user_video error: {e}")
+        return None
+
+def create_intro_clip_from_user_video(user_video_path, intro_audio_path, trim_to_audio=True):
+    """
+    Loop the user's intro video until the narration ends, overlay AI narration,
+    and return the generated intro clip path.
+    """
+    try:
+        # ensure normalized size
+        norm_path = os.path.join(TEMP_DIR, f"norm_{uuid4().hex}.mp4")
+        norm = normalize_user_video(user_video_path, out_path=norm_path)
+        if not norm:
+            return None
+
+        # duration of TTS audio
+        audio_dur = AudioSegment.from_file(intro_audio_path).duration_seconds
+        t = audio_dur if trim_to_audio else AudioSegment.from_file(user_video_path).duration_seconds
+
+        out_path = os.path.join(TEMP_DIR, f"intro_clip_{uuid4().hex}.mp4")
+
+        # Loop video until narration length, overlay narration audio
+        video_stream = ffmpeg.input(norm, stream_loop=-1)
+        audio_stream = ffmpeg.input(intro_audio_path)
+
+        (
+            ffmpeg
+            .output(
+                video_stream,
+                audio_stream,
+                out_path,
+                t=t,
+                vcodec='libx264',
+                acodec='aac',
+                pix_fmt='yuv420p',
+                r=24
+            )
+            .global_args('-loglevel', 'error')
+            .run(overwrite_output=True)
+        )
+
+        # cleanup normalized copy
+        try:
+            os.remove(norm)
+        except:
+            pass
+        return out_path
+    except Exception as e:
+        logger.error(f"create_intro_clip_from_user_video error: {e}")
+        return None
+
+def make_slide_video(image_path, audio_path, out_path):
+    """
+    Create a video from a static image and an audio file.
+    Use separate ffmpeg inputs to avoid FilterableStream errors.
+    """
+    try:
+        dur = AudioSegment.from_file(audio_path).duration_seconds
+    except Exception:
+        dur = None
+
+    img_stream = ffmpeg.input(image_path, loop=1, t=dur if dur else None)
+    aud_stream = ffmpeg.input(audio_path)
+    (
+        ffmpeg
+        .output(img_stream, aud_stream, out_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', r=24)
+        .global_args('-loglevel', 'error')
+        .run(overwrite_output=True)
+    )
+    return out_path
+
+# --------------------------
+# 6) Task runner (main flow) — UPDATED: loop intro video until narration ends, skip slide 1
+# --------------------------
+def run_task(task_id, topics, side_imgs, bg_imgs, uploaded_intro_video_path=None):
+    try:
+        results = []
+        tasks[task_id]["status"] = "processing"
+
+        # Pre-normalize intro video once if provided
+        normalized_intro_src = None
+        if uploaded_intro_video_path:
+            normalized_intro_src = normalize_user_video(uploaded_intro_video_path)
+
+        for topic in topics:
+            logger.info(f"Processing topic: {topic}")
+            # 1. generate script and parse
+            script = generate_script(topic)
+            slides = parse_script(script, topic)
+
+            # 2. create TTS audios for all slides
+            audios = create_audio_segments(slides)
+            # If audios shorter than slides, fill with silence
+            while len(audios) < len(slides):
+                p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
+                AudioSegment.silent(duration=1500).export(p, format="mp3")
+                audios.append(p)
+
+            # 3. prepare intro clip (use first slide audio) -> loop or trim user video to narration length and overlay audio
+            intro_clip = None
+            if normalized_intro_src and len(slides) > 0:
+                try:
+                    intro_clip = create_intro_clip_from_user_video(normalized_intro_src, audios[0], trim_to_audio=True)
+                    logger.info(f"Intro clip created for topic '{topic}': {intro_clip}")
+                except Exception as e:
+                    logger.warning(f"Failed creating intro clip from uploaded video for topic '{topic}': {e}")
+                    intro_clip = None
+            else:
+                # fallback: image-based intro if no upload
+                try:
+                    img_intro = create_slide_image(slides[0], side_imgs, bg_imgs)
+                    img_path = os.path.join(TEMP_DIR, f"intro_img_{uuid4().hex}.png")
+                    img_intro.save(img_path)
+                    intro_clip_tmp = os.path.join(TEMP_DIR, f"intro_tmp_{uuid4().hex}.mp4")
+                    make_slide_video(img_path, audios[0], intro_clip_tmp)
+                    intro_clip = intro_clip_tmp
+                    try:
+                        os.remove(img_path)
+                    except: pass
+                    logger.info(f"Fallback intro clip created for topic '{topic}': {intro_clip}")
+                except Exception as e:
+                    logger.warning(f"Fallback intro creation failed for topic '{topic}': {e}")
+                    intro_clip = None
+
+            # 4. make slide videos SKIPPING slide index 0 (we used its narration in intro)
+            slide_vids = []
+            for i in range(1, len(slides)):
+                slide = slides[i]
+                image = create_slide_image(slide, side_imgs, bg_imgs)
+                img_path = os.path.join(TEMP_DIR, f"{uuid4().hex}.png")
+                image.save(img_path)
+                vid_path = os.path.join(TEMP_DIR, f"{uuid4().hex}.mp4")
+                make_slide_video(img_path, audios[i], vid_path)
+                slide_vids.append(vid_path)
+                # cleanup image
+                try:
+                    os.remove(img_path)
+                except:
+                    pass
+
+            # 5. build final sequence: intro + slides(2..N)
+            sequence = []
+            if intro_clip:
+                sequence.append(intro_clip)
+            sequence.extend(slide_vids)
+
+            # safe concat: move/rename clips into TEMP with safe names
+            concat_list_path = os.path.join(TEMP_DIR, f"concat_{uuid4().hex}.txt")
+            with open(concat_list_path, "w", encoding="utf-8") as f:
+                for clip in sequence:
+                    # make safe name
+                    raw = os.path.basename(clip)
+                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
+                    dest = os.path.join(TEMP_DIR, safe)
+                    try:
+                        if os.path.abspath(clip) != os.path.abspath(dest):
+                            shutil.move(clip, dest)
+                        else:
+                            dest = clip
+                    except Exception:
+                        # fallback to copying
+                        try:
+                            shutil.copy2(clip, dest)
+                        except Exception as e:
+                            logger.warning(f"Could not move or copy clip {clip} to {dest}: {e}")
+                    f.write(f"file '{safe}'\n")
+
+            # run concat
+            out_file = os.path.join(OUTPUT_DIR, f"{slugify(topic, 40)}_{uuid4().hex[:6]}.mp4")
+            cwd = os.getcwd()
+            os.chdir(TEMP_DIR)
+            try:
+                (
+                    ffmpeg
+                    .input(os.path.basename(concat_list_path), format="concat", safe=0)
+                    .output(os.path.join(cwd, out_file), c="copy")
+                    .global_args("-loglevel", "error")
+                    .run(overwrite_output=True)
+                )
+            finally:
+                os.chdir(cwd)
+
+            results.append(out_file)
+            logger.info(f"Generated: {out_file}")
+
+            # cleanup per-topic audio files
+            for a in audios:
+                try:
+                    os.remove(a)
+                except:
+                    pass
+
+            # leave final clip(s) in TEMP (they moved) — don't delete slides we moved
+            try:
+                os.remove(concat_list_path)
+            except:
+                pass
+
+        # zip results
+        zip_path = os.path.join(OUTPUT_DIR, f"{task_id}.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in results:
+                zf.write(r, os.path.basename(r))
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["zip"] = zip_path
+        tasks[task_id]["videos"] = results
+        logger.info(f"Task {task_id} completed successfully.")
+    except Exception as e:
+        logger.exception("run_task failed")
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["error"] = str(e)
+
+# --------------------------
+# 7) Routes
+# --------------------------
+@app.route("/generate-bulk-videos", methods=["POST"])
+def generate_bulk():
+    # topics = JSON array in form data 'topics'
+    try:
+        topics = json.loads(request.form.get("topics", "[]"))
+    except Exception:
+        return jsonify({"error": "Invalid topics format"}), 400
+
+    # save uploaded side/bg images and uploaded intro video (single)
+    def save_files(key):
+        arr = []
+        for f in request.files.getlist(key):
+            if f and f.filename:
+                path = os.path.join(UPLOADS_DIR, f"{uuid4().hex}_{secure_filename(f.filename)}")
+                f.save(path)
+                arr.append(path)
+        return arr
+
+    side_imgs = save_files("images_side")
+    bg_imgs = save_files("images_bg")
+    # support single uploaded intro video field name 'intro_video'
+    intro_videos = save_files("intro_video")
+    uploaded_intro = intro_videos[0] if intro_videos else None
+
+    # create task
+    task_id = uuid4().hex
+    tasks[task_id] = {"status": "processing"}
+    # start background thread: every topic uses the same uploaded_intro (looped/trimmed)
+    threading.Thread(target=run_task, args=(task_id, topics, side_imgs, bg_imgs, uploaded_intro), daemon=True).start()
+    return jsonify({"task_id": task_id})
+
+@app.route("/check-status/<task_id>")
+def check_status(task_id):
+    return jsonify(tasks.get(task_id, {"status": "not_found"}))
+
+@app.route("/download/<task_id>")
+def download(task_id):
+    t = tasks.get(task_id)
+    if not t:
+        return "", 404
+    if t.get("status") != "completed":
+        return jsonify(t), 400
+    zip_path = t.get("zip")
+    if not zip_path or not os.path.exists(zip_path):
+        return "", 404
+    return send_file(zip_path, as_attachment=True)
+
+@app.route("/cleanup/<task_id>", methods=["POST"])
+def cleanup(task_id):
+    t = tasks.get(task_id)
+    if not t:
+        return jsonify({"status": "not_found"})
+    # remove zip and output video files
+    try:
+        zipf = t.get("zip")
+        vids = t.get("videos", [])
+        if zipf and os.path.exists(zipf):
+            os.remove(zipf)
+        for v in vids:
+            try:
+                os.remove(v)
+            except:
+                pass
+    except Exception as e:
+        logger.warning(f"cleanup issue: {e}")
+    del tasks[task_id]
+    return jsonify({"status": "ok"})
+
+# --------------------------
+# 8) Run server
+# --------------------------
+if __name__ == "__main__":
+    logger.info("Starting bulk video generator API...")
+    logger.info("Make sure ffmpeg is installed and GEMINI_API_KEY is set.")
+    app.run(host="0.0.0.0", port=8000, debug=True)
+
