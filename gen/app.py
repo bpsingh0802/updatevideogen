@@ -2475,1435 +2475,1590 @@
 
 
 
-# One the Best Code
-import os
-import sys
-import time
-import logging
-import re
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import cv2
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-import textwrap
-from pydub import AudioSegment
-import ffmpeg
-import google.generativeai as genai
-import zipfile
-from io import BytesIO
-from uuid import uuid4
-from transformers import VitsModel, AutoTokenizer
-import torch
-import soundfile as sf
-import threading
-import json
-import random
-from werkzeug.utils import secure_filename
-
-# --- Logging Setup ---
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# --- Flask App Setup ---
-app = Flask(__name__)
-CORS(app)
-
-# === CONFIG ===
-OUTPUT_DIR = "output"
-TEMP_DIR = os.path.join(OUTPUT_DIR, "temp")
-UPLOADS_DIR = os.path.join(TEMP_DIR, "user_uploads")
-
-# Ensure directories exist
-def ensure_directories():
-    for directory in [OUTPUT_DIR, TEMP_DIR, UPLOADS_DIR]:
-        try:
-            os.makedirs(directory, exist_ok=True)
-            if not os.access(directory, os.W_OK):
-                logger.error(f"No write permission for directory: {directory}")
-                raise RuntimeError(f"No write permission for directory: {directory}")
-            logger.debug(f"Directory {directory} is writable")
-        except Exception as e:
-            logger.error(f"Failed to create or access directory {directory}: {str(e)}")
-            raise RuntimeError(f"Failed to create or access directory {directory}: {str(e)}")
-
-ensure_directories()
-
-# Store task status
-tasks = {}
-MODELS = {}
-
-# === Language Detection and TTS ===
-def detect_language(text):
-    if re.search(r"[\u0900-\u097F]", text):
-        return "hi"
-    return "en"
-
-def load_model(language):
-    try:
-        if language not in MODELS:
-            model_name = "facebook/mms-tts-hin" if language == "hi" else "facebook/mms-tts-eng"
-            logger.debug(f"Loading model: {model_name}")
-            MODELS[language] = {
-                'model': VitsModel.from_pretrained(model_name),
-                'tokenizer': AutoTokenizer.from_pretrained(model_name)
-            }
-        return MODELS[language]['model'], MODELS[language]['tokenizer']
-    except Exception as e:
-        logger.error(f"Failed to load model for language '{language}': {str(e)}")
-        raise RuntimeError(f"Failed to load model: {e}")
-
-# === AI and Presentation Functions ===
-def generate_script_with_ai(topic, num_steps=5):
-    # You can change this to use environment variable if you want
-    api_key = 'AIzaSyDsX3v0ZmjN5Rezia5CnFaEbNlvbAjwy18'
-    if not api_key:
-        logger.error("GEMINI_API_KEY not set")
-        raise RuntimeError("GEMINI_API_KEY not provided")
-    
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.5-flash')
-
-    # STORYTELLING + STEPWISE + NO 'Content:' + HUMAN STYLE
-    prompt = (
-        f"Create a natural, human-sounding YouTube tutorial on the topic '{topic}'. "
-        f"Make it a light storytelling style but still step-by-step.\n\n"
-
-        "STRICT FORMAT:\n"
-        "Step X: [Short, simple, storytelling-style title]\n"
-        "[4–6 sentences of natural explanation on the next line(s). "
-        "Explain like talking to a friend. Use micro-story hints like: "
-        "'Imagine this', 'Picture this', 'You might notice', "
-        "'Most people get stuck here', 'At this point', etc. "
-        "Keep it friendly, simple and realistic.]\n\n"
-
-        "RULES:\n"
-        "- Do NOT write the word 'Content:' anywhere.\n"
-        "- Do NOT include any intro or outro.\n"
-        "- Start directly with 'Step 1:'.\n"
-        "- After each 'Step X:' line, immediately start the explanation on the next line.\n"
-        "- Use simple, spoken-style language (no heavy vocabulary).\n"
-        "- Avoid robotic tone and repetitive phrases.\n"
-    )
-
-    try:
-        response = model.generate_content(prompt)
-        script_text = response.text.strip()
-        if not script_text.startswith("Step 1:"):
-            logger.error(f"Invalid script format for topic '{topic}': {script_text[:80]}...")
-            raise ValueError("AI did not return the expected script format (must start with 'Step 1:')")
-        return script_text
-    except Exception as e:
-        logger.error(f"AI script generation failed for topic '{topic}': {str(e)}")
-        raise RuntimeError(f"AI script generation failed: {e}")
-
-def parse_script(script_text, topic):
-    slides = []
-
-    # Intro slide (static)
-    intro_title = f"Hello Guys, in this video we will see {topic} ✨"
-    intro_content = (
-        "• We’ll go through the steps in a simple way.\n"
-        "• Just watch till the end and follow along."
-    )
-    slides.append({'title': intro_title, 'content': intro_content})
-
-    # Split on "Step X:"
-    sections = re.split(r"Step \d+:", script_text, flags=re.IGNORECASE)
-    parsed_sections = sections[1:]  # first split part is before Step 1, ignore
-
-    if not parsed_sections:
-        logger.error("No valid steps parsed from AI script.")
-        slides.append({
-            'title': "AI Scripting Error",
-            'content': "Failed to generate a valid script. Please try again."
-        })
-        return slides
-
-    for i, section in enumerate(parsed_sections):
-        # section looks like: " Title text\nExplanation sentences..."
-        lines = section.strip().split("\n", 1)
-        if len(lines) < 2:
-            continue
-
-        step_title_text = lines[0].strip()
-        raw_content = lines[1].strip()
-
-        # Step title with a little flare
-        title = f"Step {i+1}: {step_title_text} ✨"
-
-        # Break explanation into bullet points for slides (but not for audio)
-        points = [p.strip() for p in re.split(r'[.!?]\s+', raw_content) if p.strip()]
-        content = "\n".join([
-            f"• {p}{'.' if not p.endswith(('.', '!', '?')) else ''}"
-            for p in points
-        ])
-
-        slides.append({'title': title, 'content': content})
-
-    logger.debug(f"Parsed {len(slides)} total slides.")
-    return slides
-
-#
-# ==================================================================
-# === Image Generation Functions (Helpers) ===
-# ==================================================================
-#
-def get_font_path(font_size=60):
-    font_paths = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/System/Library/Fonts/HelveticaNeue.ttc",
-        os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "arial.ttf"),
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    font_path = next((path for path in font_paths if os.path.exists(path)), None)
-    try:
-        if font_path:
-            font = ImageFont.truetype(font_path, font_size)
-        else:
-            font = ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
-        logger.warning("Font loading failed. Using default.")
-    return font, font_path
-
-def draw_text_in_box(draw, text, box_bounds, font_size=60):
-    font, font_path = get_font_path(font_size)
-    title, content = text.split("\n\n", 1) if "\n\n" in text else (text, "")
-
-    y_start_offset = box_bounds[1] + 40
-    x_left_offset = box_bounds[0] + 40
-    x_right_limit = box_bounds[2] - 40
-    box_width = x_right_limit - x_left_offset
-
-    current_font_size = font_size
-    final_font = font
-
-    while current_font_size >= 25:
-        try:
-            temp_font = ImageFont.truetype(font_path, current_font_size) if font_path else ImageFont.load_default()
-        except Exception:
-            temp_font = ImageFont.load_default()
-
-        title_width_char = int(box_width / (current_font_size * 0.45))
-        content_width_char = int(box_width / (current_font_size * 0.4))
-        if title_width_char <= 0 or content_width_char <= 0:
-            current_font_size -= 2
-            continue
-
-        wrapped_title_lines = textwrap.wrap(title, width=title_width_char)
-        wrapped_content_lines = [
-            line for p in content.split('\n')
-            for line in textwrap.wrap(p, width=content_width_char)
-        ]
-
-        total_text_height = 0
-        for line in wrapped_title_lines:
-            bbox = draw.textbbox((0, 0), line, font=temp_font)
-            total_text_height += (bbox[3] - bbox[1]) + 15
-
-        total_text_height += 30
-
-        for line in wrapped_content_lines:
-            bbox = draw.textbbox((0, 0), line, font=temp_font)
-            total_text_height += (bbox[3] - bbox[1]) + 10
-
-        if (y_start_offset + total_text_height + 40) < box_bounds[3]:
-            final_font = temp_font
-            break
-
-        current_font_size -= 2
-
-    title_width_char = int(box_width / (current_font_size * 0.45))
-    content_width_char = int(box_width / (current_font_size * 0.4))
-    wrapped_title_lines = textwrap.wrap(title, width=title_width_char)
-    wrapped_content_lines = [
-        line for p in content.split('\n')
-        for line in textwrap.wrap(p, width=content_width_char)
-    ]
-
-    y_text_current = y_start_offset
-
-    # Draw title
-    for line in wrapped_title_lines:
-        try:
-            text_width = draw.textlength(line, font=final_font)
-        except Exception:
-            bbox = draw.textbbox((0, 0), line, font=final_font)
-            text_width = bbox[2] - bbox[0]
-
-        x_centered = x_left_offset + (box_width - text_width) // 2
-        draw.text((x_centered + 3, y_text_current + 3), line, font=final_font, fill=(80, 80, 80))
-        draw.text((x_centered, y_text_current), line, font=final_font, fill='black')
-
-        bbox = draw.textbbox((0, 0), line, font=final_font)
-        y_text_current += (bbox[3] - bbox[1]) + 15
-
-    y_text_current += 30
-
-    # Draw content
-    for line in wrapped_content_lines:
-        draw.text((x_left_offset + 3, y_text_current + 3), line, font=final_font, fill=(100, 100, 100))
-        draw.text((x_left_offset, y_text_current), line, font=final_font, fill='black')
-        bbox = draw.textbbox((0, 0), line, font=final_font)
-        y_text_current += (bbox[3] - bbox[1]) + 10
-
-def create_base_image(image_paths_bg, size=(1920, 1080)):
-    """Creates the base layer, either a blurred BG or a gradient."""
-    if image_paths_bg:
-        chosen_image_path = random.choice(image_paths_bg)
-        img = Image.open(chosen_image_path).convert('RGB')
-        img = img.resize(size, Image.Resampling.LANCZOS)
-        img = img.filter(ImageFilter.GaussianBlur(radius=10))
-    else:
-        start_color = (255, 255, 255)
-        end_color = (240, 248, 255)
-        img = Image.new('RGB', size, color=start_color)
-        draw = ImageDraw.Draw(img)
-        for y in range(size[1]):
-            r, g, b = [
-                int(start_color[i] + (end_color[i] - start_color[i]) * y / size[1])
-                for i in range(3)
-            ]
-            draw.line([(0, y), (size[0], y)], fill=(r, g, b), width=1)
-    return img
-
-def draw_text_box(img, box_bounds, radius=20):
-    """Draws the white rounded rectangle for text."""
-    temp_img = Image.new('RGBA', img.size, (0, 0, 0, 0))
-    temp_draw = ImageDraw.Draw(temp_img)
-
-    shadow_bounds = (
-        box_bounds[0] + 10,
-        box_bounds[1] + 10,
-        box_bounds[2] + 10,
-        box_bounds[3] + 10
-    )
-    temp_draw.rounded_rectangle(
-        shadow_bounds,
-        radius=radius,
-        fill=(200, 200, 200, 150)
-    )
-    temp_draw.rounded_rectangle(
-        box_bounds,
-        radius=radius,
-        fill=(255, 255, 255, 230)
-    )
-    return Image.alpha_composite(img.convert('RGBA'), temp_img).convert('RGB')
-
-def create_text_image_sidebyside(text, image_paths_side, image_paths_bg, size=(1920, 1080), font_size=60):
-    try:
-        img = create_base_image(image_paths_bg, size)
-
-        padding, gap, border_radius = 100, 75, 25
-        text_width_percent = 0.55
-        total_content_width = size[0] - (2 * padding) - gap
-        text_box_width = int(total_content_width * text_width_percent)
-        img_box_width = total_content_width - text_box_width
-        box_y, box_height = padding, size[1] - (2 * padding)
-
-        if random.choice([True, False]):
-            img_box_x = padding
-            text_box_x = padding + img_box_width + gap
-        else:
-            text_box_x = padding
-            img_box_x = padding + text_box_width + gap
-
-        text_box_bounds = (text_box_x, box_y, text_box_x + text_box_width, box_y + box_height)
-        img_box_bounds = (img_box_x, box_y, img_box_x + img_box_width, box_y + box_height)
-
-        # Draw Image Box (from side images)
-        if image_paths_side:
-            img_to_paste_path = random.choice(image_paths_side)
-            img_to_paste = Image.open(img_to_paste_path).convert('RGB')
-
-            img_ratio = img_to_paste.width / img_to_paste.height
-            box_ratio = img_box_width / box_height
-
-            if img_ratio > box_ratio:
-                new_height = box_height
-                new_width = int(new_height * img_ratio)
-                img_to_paste = img_to_paste.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                crop_x = (new_width - img_box_width) // 2
-                img_to_paste = img_to_paste.crop((crop_x, 0, crop_x + img_box_width, new_height))
-            else:
-                new_width = img_box_width
-                new_height = int(new_width / img_ratio)
-                img_to_paste = img_to_paste.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                crop_y = (new_height - box_height) // 2
-                img_to_paste = img_to_paste.crop((0, crop_y, new_width, crop_y + box_height))
-
-            img_mask = Image.new('L', (img_box_width, box_height), 0)
-            ImageDraw.Draw(img_mask).rounded_rectangle(
-                (0, 0, img_box_width, box_height),
-                radius=border_radius,
-                fill=255
-            )
-            img.paste(img_to_paste, img_box_bounds, mask=img_mask)
-
-        img = draw_text_box(img, text_box_bounds, border_radius)
-        draw_text_in_box(ImageDraw.Draw(img), text, text_box_bounds, font_size)
-
-        return img.resize((1280, 720), Image.Resampling.LANCZOS)
-    except Exception as e:
-        logger.error(f"Failed to create side-by-side image: {str(e)}")
-        raise RuntimeError(f"Failed to create side-by-side image: {e}")
-
-def create_text_image_background(text, image_paths_bg, size=(1920, 1080), font_size=60):
-    try:
-        img = create_base_image(image_paths_bg, size)
-        padding = 75
-        border_radius = 20
-        text_box_bounds = (padding, padding, size[0] - padding, size[1] - padding)
-
-        img = draw_text_box(img, text_box_bounds, border_radius)
-        draw_text_in_box(ImageDraw.Draw(img), text, text_box_bounds, font_size)
-
-        return img.resize((1280, 720), Image.Resampling.LANCZOS)
-    except Exception as e:
-        logger.error(f"Failed to create background image: {str(e)}")
-        raise RuntimeError(f"Failed to create background image: {e}")
-
-#
-# ==================================================================
-# === TEXT PREPROCESSING FOR TTS (Auto Pause Injection)
-# ==================================================================
-#
-def preprocess_text_for_tts(text: str) -> str:
-    """
-    Make text more natural for MMS TTS:
-    - Remove bullet characters
-    - Normalize spaces
-    - Automatically inject pauses using patterns that MMS TTS responds to:
-      * short pause   -> ','
-      * medium pause  -> ' - '
-      * long pause    -> '. .' (extra period)
-    """
-    # Remove bullet points for audio
-    text = text.replace("•", " ")
-
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    # Inject medium pauses after commas
-    text = text.replace(", ", ", - ")
-
-    # Inject long pauses between sentences
-    text = text.replace(". ", ". . ")
-    text = text.replace("? ", "? . ")
-    text = text.replace("! ", "! . ")
-
-    return text
-
-def create_audio_segments(slides, topic_title):
-    audio_paths = []
-    pause_segment = AudioSegment.silent(duration=350)  # small natural pause at end of each slide
-
-    for i, slide in enumerate(slides):
-        # For audio: title + content, but content without bullets/newlines
-        content_for_audio = slide['content'].replace("•", " ")
-        content_for_audio = re.sub(r'\s+', ' ', content_for_audio).strip()
-
-        script_text = f"{slide['title']}. {content_for_audio}"
-        if not script_text or not script_text.strip():
-            continue
-
-        # Auto-pause injection for MMS TTS
-        script_text_for_tts = preprocess_text_for_tts(script_text)
-
-        sanitized_topic = "".join(c for c in topic_title if c.isalnum())[:15]
-        temp_wav_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}_temp.wav")
-        audio_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_slide{i+1}_{uuid4().hex[:8]}.mp3")
-
-        lang = detect_language(script_text_for_tts)
-        model, tokenizer = load_model(lang)
-
-        inputs = tokenizer(script_text_for_tts, return_tensors="pt", padding=True, truncation=True)
-        with torch.no_grad():
-            outputs = model(**inputs).waveform
-
-        waveform = outputs[0].cpu().numpy()
-        rate = model.config.sampling_rate
-
-        # Save raw output
-        sf.write(temp_wav_path, waveform, rate)
-
-        # Load into pydub for humanization
-        audio = AudioSegment.from_wav(temp_wav_path)
-
-        # -------------------------
-        #  HUMANIZATION PROCESSING
-        # -------------------------
-
-        # 1. Slight low-pass to soften harsh robotic highs
-        audio = audio.low_pass_filter(7000)
-
-        # 2. Slight pitch warmth (decrease frame rate a bit)
-        audio = audio._spawn(audio.raw_data, overrides={
-            "frame_rate": int(audio.frame_rate * 0.94)
-        }).set_frame_rate(audio.frame_rate)
-
-        # 3. Speed normalization (slightly faster to feel natural)
-        try:
-            audio = audio.speedup(playback_speed=1.06, chunk_size=50, crossfade=20)
-        except Exception as e:
-            logger.warning(f"Speedup failed for slide {i+1}, using original speed: {e}")
-
-        # 4. Small "breathing" pause at start
-        breath = AudioSegment.silent(duration=120)
-        audio = breath + audio
-
-        # 5. Ending pause
-        final_audio = audio + pause_segment
-
-        final_audio.export(audio_path, format="mp3")
-
-        # cleanup temp wav
-        if os.path.exists(temp_wav_path):
-            os.remove(temp_wav_path)
-
-        audio_paths.append(audio_path)
-        logger.debug(f"Human-enhanced audio for slide {i+1} generated at {audio_path}")
-
-    return audio_paths
-
-#
-# ==================================================================
-# === create_video (Uses both image lists)
-# ==================================================================
-#
-def create_video(slides, audio_paths, topic_title, image_paths_side, image_paths_bg):
-    try:
-        temp_segment_paths = []
-
-        INTERSTITIAL_DURATION_MS = 3000
-        silent_audio_path = os.path.join(TEMP_DIR, f"silent_audio_{uuid4().hex[:8]}.mp3")
-
-        # Create silent audio only if background images are provided
-        if image_paths_bg:
-            AudioSegment.silent(duration=INTERSTITIAL_DURATION_MS).export(silent_audio_path, format="mp3")
-
-        for i, slide in enumerate(slides):
-            if i >= len(audio_paths):
-                logger.warning(f"No audio file found for slide {i+1}. Skipping.")
-                continue
-
-            # === 1. CREATE THE MAIN SLIDE ===
-            audio_path = audio_paths[i]
-            slide_text = f"{slide['title']}\n\n{slide['content']}"
-
-            # Intelligent Layout:
-            if image_paths_side:
-                image_pil = create_text_image_sidebyside(slide_text, image_paths_side, image_paths_bg)
-            else:
-                image_pil = create_text_image_background(slide_text, image_paths_bg)
-
-            temp_image_path = os.path.join(TEMP_DIR, f"slide_image_{i}_{uuid4().hex[:8]}.png")
-            image_pil.save(temp_image_path)
-
-            audio_duration = len(AudioSegment.from_file(audio_path)) / 1000.0
-
-            temp_video_clip_path = os.path.join(TEMP_DIR, f"clip_{i}_{uuid4().hex[:8]}.mp4")
-            (
-                ffmpeg.input(temp_image_path, loop=1, t=audio_duration)
-                .output(temp_video_clip_path, vcodec='libx264', pix_fmt='yuv420p', r=24, preset='fast')
-                .run(overwrite_output=True, quiet=True)
-            )
-
-            final_segment_path = os.path.join(TEMP_DIR, f"final_segment_{i}_{uuid4().hex[:8]}.mp4")
-            video_stream = ffmpeg.input(temp_video_clip_path)
-            audio_stream = ffmpeg.input(audio_path)
-            ffmpeg.output(
-                video_stream,
-                audio_stream,
-                final_segment_path,
-                vcodec='copy',
-                acodec='aac',
-                shortest=None,
-                strict='experimental'
-            ).run(overwrite_output=True, quiet=True)
-
-            temp_segment_paths.append(final_segment_path)
-            os.remove(temp_image_path)
-            os.remove(temp_video_clip_path)
-            logger.debug(f"Generated and synced video segment for slide {i+1}")
-
-            # === 2. INTERSTITIAL (Only if BG images are provided) ===
-            if image_paths_bg and i < len(slides) - 1:
-                logger.debug(f"Creating interstitial image after slide {i+1}")
-
-                chosen_image_path = random.choice(image_paths_bg)
-                img = Image.open(chosen_image_path).convert('RGB')
-
-                img_ratio = img.width / img.height
-                box_ratio = 1920 / 1080
-                if img_ratio > box_ratio:
-                    new_height = 1080
-                    new_width = int(new_height * img_ratio)
-                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    crop_x = (new_width - 1920) // 2
-                    img = img.crop((crop_x, 0, crop_x + 1920, 1080))
-                else:
-                    new_width = 1920
-                    new_height = int(new_width / img_ratio)
-                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    crop_y = (new_height - 1080) // 2
-                    img = img.crop((0, crop_y, 1920, crop_y + 1080))
-
-                img = img.resize((1280, 720), Image.Resampling.LANCZOS)
-                temp_interstitial_img_path = os.path.join(TEMP_DIR, f"interstitial_img_{i}_{uuid4().hex[:8]}.png")
-                img.save(temp_interstitial_img_path)
-
-                temp_interstitial_video_path = os.path.join(TEMP_DIR, f"interstitial_video_{i}_{uuid4().hex[:8]}.mp4")
-                (
-                    ffmpeg.input(temp_interstitial_img_path, loop=1, t=(INTERSTITIAL_DURATION_MS / 1000.0))
-                    .output(temp_interstitial_video_path, vcodec='libx264', pix_fmt='yuv420p', r=24, preset='fast')
-                    .run(overwrite_output=True, quiet=True)
-                )
-
-                final_interstitial_segment_path = os.path.join(TEMP_DIR, f"final_interstitial_{i}_{uuid4().hex[:8]}.mp4")
-                video_stream = ffmpeg.input(temp_interstitial_video_path)
-                audio_stream = ffmpeg.input(silent_audio_path)
-                ffmpeg.output(
-                    video_stream,
-                    audio_stream,
-                    final_interstitial_segment_path,
-                    vcodec='copy',
-                    acodec='aac',
-                    shortest=None,
-                    strict='experimental'
-                ).run(overwrite_output=True, quiet=True)
-
-                temp_segment_paths.append(final_interstitial_segment_path)
-                os.remove(temp_interstitial_img_path)
-                os.remove(temp_interstitial_video_path)
-
-        if not temp_segment_paths:
-            raise RuntimeError("No synchronized video segments were created.")
-
-        # 3. Concatenate all segments
-        sanitized_topic = "".join(c for c in topic_title if c.isalnum())[:15]
-        concat_list_path = os.path.join(TEMP_DIR, f"concat_list_{sanitized_topic}_{uuid4().hex[:8]}.txt")
-
-        with open(concat_list_path, 'w') as f:
-            for path in temp_segment_paths:
-                f.write(f"file '{os.path.basename(path)}'\n")
-
-        final_video_path = os.path.join(OUTPUT_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}.mp4")
-
-        current_dir = os.getcwd()
-        os.chdir(TEMP_DIR)
-        try:
-            (
-                ffmpeg.input(os.path.basename(concat_list_path), f='concat', safe=0)
-                .output(os.path.join(current_dir, final_video_path), c='copy')
-                .run(overwrite_output=True, quiet=True)
-            )
-        finally:
-            os.chdir(current_dir)
-
-        # 4. Clean up
-        files_to_clean = temp_segment_paths + audio_paths + [os.path.join(TEMP_DIR, os.path.basename(concat_list_path))]
-        if image_paths_bg and os.path.exists(silent_audio_path):
-            files_to_clean.append(silent_audio_path)
-
-        for path in files_to_clean:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete temp file {path}: {str(e)}")
-
-        logger.info(f"Final video created successfully at: {final_video_path}")
-        return final_video_path
-
-    except Exception as e:
-        logger.error(f"Failed to create final video for topic '{topic_title}': {str(e)}")
-        raise RuntimeError(f"Failed to create video: {e}")
-
-# === Task Management Thread ===
-def generate_videos_and_zip(task_id, topics, image_paths_side, image_paths_bg):
-    global MODELS
-    tasks[task_id]['failed_topics'] = []
-
-    try:
-        generated_video_paths = []
-
-        for topic in topics:
-            logger.info(f"Processing topic: {topic}")
-            try:
-                script = generate_script_with_ai(topic)
-                slides = parse_script(script, topic)
-                audio_paths = create_audio_segments(slides, topic)
-                video_path = create_video(slides, audio_paths, topic, image_paths_side, image_paths_bg)
-                generated_video_paths.append(video_path)
-                logger.info(f"Successfully generated video for topic: {topic}")
-            except Exception as e:
-                logger.error(f"Failed to process topic '{topic}': {str(e)}")
-                tasks[task_id]['failed_topics'].append({'topic': topic, 'error': str(e)})
-                if 'audio_paths' in locals():
-                    for path in audio_paths:
-                        if os.path.exists(path):
-                            os.remove(path)
-                continue
-            finally:
-                # clear loaded models to free RAM between topics
-                MODELS.clear()
-
-        if not generated_video_paths:
-            logger.error(f"No videos generated for task {task_id}")
-            tasks[task_id]['status'] = 'failed'
-            tasks[task_id]['error'] = 'No videos were generated successfully'
-            return
-
-        # Zipping
-        zip_file_path = os.path.join(OUTPUT_DIR, f"{task_id}.zip")
-        with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for video_path in generated_video_paths:
-                if os.path.exists(video_path):
-                    zipf.write(video_path, os.path.basename(video_path))
-
-        # Cleanup videos
-        for video_path in generated_video_paths:
-            if os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete video file {video_path}: {str(e)}")
-
-        tasks[task_id]['status'] = 'completed'
-        tasks[task_id]['zip_file_path'] = zip_file_path
-        logger.info(f"Task {task_id} completed successfully")
-
-    except Exception as e:
-        logger.error(f"Fatal error generating videos for task {task_id}: {str(e)}")
-        tasks[task_id]['status'] = 'failed'
-        tasks[task_id]['error'] = f"Fatal task failure: {str(e)}"
-
-    finally:
-        # Cleanup ALL uploaded images
-        all_image_paths = image_paths_side + image_paths_bg
-        for img_path in all_image_paths:
-            if os.path.exists(img_path):
-                try:
-                    os.remove(img_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete uploaded image {img_path}: {str(e)}")
-
-#
-# ==================================================================
-# === API Endpoint (Accepts two image lists)
-# ==================================================================
-#
-@app.route('/generate-bulk-videos', methods=['POST'])
-def handle_generate_bulk_videos():
-    def save_files(file_list):
-        """Helper to save a list of files and return their paths."""
-        paths = []
-        for file in file_list:
-            if file and file.filename:
-                try:
-                    filename = secure_filename(file.filename)
-                    save_path = os.path.join(UPLOADS_DIR, f"{uuid4().hex}_{filename}")
-                    file.save(save_path)
-                    paths.append(save_path)
-                except Exception as e:
-                    logger.warning(f"Failed to save uploaded file {file.filename}: {e}")
-        return paths
-
-    # 1. Get topics string
-    topics_str = request.form.get('topics')
-    if not topics_str:
-        return jsonify({'error': 'A list of topics is required.'}), 400
-    try:
-        topics = json.loads(topics_str)
-        if not topics or not isinstance(topics, list) or not all(isinstance(t, str) for t in topics):
-            raise ValueError("Invalid topics format")
-    except Exception as e:
-        return jsonify({'error': 'Invalid topics format. Must be a JSON list of strings.'}), 400
-    logger.info(f"Received topics: {topics}")
-
-    # 2. Get image files from both lists
-    image_files_side = request.files.getlist('images_side')
-    image_files_bg = request.files.getlist('images_bg')
-
-    image_paths_side = save_files(image_files_side)
-    image_paths_bg = save_files(image_files_bg)
-
-    if image_paths_side:
-        logger.info(f"Saved {len(image_paths_side)} side images.")
-    if image_paths_bg:
-        logger.info(f"Saved {len(image_paths_bg)} background images.")
-    if not image_paths_side and not image_paths_bg:
-        logger.info("No images uploaded. Proceeding with default gradient backgrounds.")
-
-    task_id = str(uuid4())
-    tasks[task_id] = {'status': 'processing', 'topics': topics}
-
-    # 3. Start thread with both image lists
-    threading.Thread(
-        target=generate_videos_and_zip,
-        args=(task_id, topics, image_paths_side, image_paths_bg),
-        daemon=True
-    ).start()
-
-    return jsonify({'task_id': task_id, 'message': 'Video generation started.'})
-
-@app.route('/check-status/<task_id>', methods=['GET'])
-def check_status(task_id):
-    task = tasks.get(task_id)
-    if not task:
-        return jsonify({'error': 'Task not found.'}), 404
-    display_task = task.copy()
-    display_task.pop('zip_file_path', None)
-    return jsonify(display_task)
-
-@app.route('/download/<task_id>', methods=['GET'])
-def download_zip(task_id):
-    task = tasks.get(task_id)
-    if not task or task['status'] != 'completed':
-        return jsonify({'error': 'File not found or generation not complete.'}), 404
-    zip_file_path = task['zip_file_path']
-    if not os.path.exists(zip_file_path):
-        return jsonify({'error': 'Zip file not found.'}), 404
-    return send_file(
-        zip_file_path,
-        as_attachment=True,
-        mimetype='application/zip',
-        download_name=f"generated_videos_{task_id}.zip"
-    )
-
-@app.route('/cleanup/<task_id>', methods=['POST'])
-def cleanup(task_id):
-    task = tasks.get(task_id)
-    if task and task.get('zip_file_path') and os.path.exists(task['zip_file_path']):
-        try:
-            os.remove(task['zip_file_path'])
-            logger.info(f"Cleaned up zip file for task {task_id}")
-        except Exception as e:
-            logger.warning(f"Failed to delete zip file {task['zip_file_path']}: {str(e)}")
-    tasks.pop(task_id, None)
-    return jsonify({'message': 'Cleanup completed.'})
-
-if __name__ == '__main__':
-    logger.info("--- REQUIREMENTS ---")
-    logger.info(">>> CRITICAL: Ensure Gemini API key is valid. <<<")
-    logger.info("Ensure all Python packages are installed: flask, pydub, google-generativeai, transformers, torch, soundfile, pillow, ffmpeg-python.")
-    logger.info("Ensure FFmpeg is installed and accessible in your system's PATH.")
-    logger.info("--------------------")
-
-    app.run(host='0.0.0.0', port=8000, debug=True, use_reloader=False)
-
-
-# # app.py
+# # One the Best Code
 # import os
-# import re
-# import json
-# import random
+# import sys
+# import time
 # import logging
-# import shutil
-# import threading
-# import zipfile
-# from uuid import uuid4
-
+# import re
 # from flask import Flask, request, jsonify, send_file
 # from flask_cors import CORS
-# from werkzeug.utils import secure_filename
-
+# import cv2
+# import numpy as np
 # from PIL import Image, ImageDraw, ImageFont, ImageFilter
 # import textwrap
-
 # from pydub import AudioSegment
 # import ffmpeg
-# import soundfile as sf
-# import torch
-# from transformers import VitsModel, AutoTokenizer
-
 # import google.generativeai as genai
+# import zipfile
+# from io import BytesIO
+# from uuid import uuid4
+# from transformers import VitsModel, AutoTokenizer
+# import torch
+# import soundfile as sf
+# import threading
+# import json
+# import random
+# from werkzeug.utils import secure_filename
 
-# # --------------------------
-# # Logging
-# # --------------------------
-# logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# # --- Logging Setup ---
+# logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 # logger = logging.getLogger(__name__)
 
-# # --------------------------
-# # Flask app + dirs
-# # --------------------------
+# # --- Flask App Setup ---
 # app = Flask(__name__)
 # CORS(app)
 
+# # === CONFIG ===
 # OUTPUT_DIR = "output"
 # TEMP_DIR = os.path.join(OUTPUT_DIR, "temp")
-# UPLOADS_DIR = os.path.join(TEMP_DIR, "uploads")
+# UPLOADS_DIR = os.path.join(TEMP_DIR, "user_uploads")
 
-# for d in [OUTPUT_DIR, TEMP_DIR, UPLOADS_DIR]:
-#     os.makedirs(d, exist_ok=True)
+# # Ensure directories exist
+# def ensure_directories():
+#     for directory in [OUTPUT_DIR, TEMP_DIR, UPLOADS_DIR]:
+#         try:
+#             os.makedirs(directory, exist_ok=True)
+#             if not os.access(directory, os.W_OK):
+#                 logger.error(f"No write permission for directory: {directory}")
+#                 raise RuntimeError(f"No write permission for directory: {directory}")
+#             logger.debug(f"Directory {directory} is writable")
+#         except Exception as e:
+#             logger.error(f"Failed to create or access directory {directory}: {str(e)}")
+#             raise RuntimeError(f"Failed to create or access directory {directory}: {str(e)}")
 
-# # --------------------------
-# # Globals
-# # --------------------------
-# tasks = {}          # task_id -> status / paths
-# MODELS = {}         # tts models cache
-# GEMINI_API_KEY = 'AIzaSyDTZAg3luaBjvIr6UYeYL1U6z2hZ2MnCKw'
+# ensure_directories()
 
-# # --------------------------
-# # Utilities
-# # --------------------------
-# def slugify(name: str, max_len=40):
-#     name = name.lower()
-#     name = re.sub(r"[^\w\s-]", "", name)
-#     name = re.sub(r"\s+", "-", name).strip("-")
-#     return name[:max_len]
+# # Store task status
+# tasks = {}
+# MODELS = {}
 
-# def safe_filename(src_path):
-#     base = os.path.basename(src_path)
-#     safe = re.sub(r"[^A-Za-z0-9._-]", "_", base)
-#     return safe
+# # === Language Detection and TTS ===
+# def detect_language(text):
+#     if re.search(r"[\u0900-\u097F]", text):
+#         return "hi"
+#     return "en"
 
-# # --------------------------
-# # 1) Gemini script generation
-# # --------------------------
-# def generate_script(topic, segments=5):
-#     if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_KEY":
-#         logger.error("GEMINI_API_KEY missing or default. Set GEMINI_API_KEY env var.")
-#         raise RuntimeError("GEMINI_API_KEY missing")
+# def load_model(language):
+#     try:
+#         if language not in MODELS:
+#             model_name = "facebook/mms-tts-hin" if language == "hi" else "facebook/mms-tts-eng"
+#             logger.debug(f"Loading model: {model_name}")
+#             MODELS[language] = {
+#                 'model': VitsModel.from_pretrained(model_name),
+#                 'tokenizer': AutoTokenizer.from_pretrained(model_name)
+#             }
+#         return MODELS[language]['model'], MODELS[language]['tokenizer']
+#     except Exception as e:
+#         logger.error(f"Failed to load model for language '{language}': {str(e)}")
+#         raise RuntimeError(f"Failed to load model: {e}")
 
-#     genai.configure(api_key=GEMINI_API_KEY)
-#     model = genai.GenerativeModel("gemini-2.5-flash")
+# # === AI and Presentation Functions ===
+# def generate_script_with_ai(topic, num_steps=5):
+#     # You can change this to use environment variable if you want
+#     api_key = 'AIzaSyDsX3v0ZmjN5Rezia5CnFaEbNlvbAjwy18'
+#     if not api_key:
+#         logger.error("GEMINI_API_KEY not set")
+#         raise RuntimeError("GEMINI_API_KEY not provided")
+    
+#     genai.configure(api_key=api_key)
+#     model = genai.GenerativeModel('gemini-2.5-flash')
 
-#     prompt = f"""
-# You are a friendly YouTuber explaining the topic: "{topic}".
-# Create {segments} segments. Keep it conversational, simple, and helpful.
+#     # STORYTELLING + STEPWISE + NO 'Content:' + HUMAN STYLE
+#     prompt = (
+#         f"Create a natural, human-sounding YouTube tutorial on the topic '{topic}'. "
+#         f"Make it a light storytelling style but still step-by-step.\n\n"
 
-# STRICT FORMAT:
-# Segment 1: [Short title]
-# Narration: [4-6 short sentences in natural spoken style]
+#         "STRICT FORMAT:\n"
+#         "Step X: [Short, simple, storytelling-style title]\n"
+#         "[4–6 sentences of natural explanation on the next line(s). "
+#         "Explain like talking to a friend. Use micro-story hints like: "
+#         "'Imagine this', 'Picture this', 'You might notice', "
+#         "'Most people get stuck here', 'At this point', etc. "
+#         "Keep it friendly, simple and realistic.]\n\n"
 
-# Segment 2: [Short title]
-# Narration: [...]
+#         "RULES:\n"
+#         "- Do NOT write the word 'Content:' anywhere.\n"
+#         "- Do NOT include any intro or outro.\n"
+#         "- Start directly with 'Step 1:'.\n"
+#         "- After each 'Step X:' line, immediately start the explanation on the next line.\n"
+#         "- Use simple, spoken-style language (no heavy vocabulary).\n"
+#         "- Avoid robotic tone and repetitive phrases.\n"
+#     )
 
-# RULES:
-# - Start directly; do not add greetings (no 'Welcome back').
-# - Do not add lists inside narration.
-# - Use contractions (don't, it's, you'll).
-# - Use light storytelling: words like 'Imagine', 'Picture this', 'You might notice'.
-# - No outro or summary at the end.
-# """
-#     response = model.generate_content(prompt)
-#     return response.text.strip()
+#     try:
+#         response = model.generate_content(prompt)
+#         script_text = response.text.strip()
+#         if not script_text.startswith("Step 1:"):
+#             logger.error(f"Invalid script format for topic '{topic}': {script_text[:80]}...")
+#             raise ValueError("AI did not return the expected script format (must start with 'Step 1:')")
+#         return script_text
+#     except Exception as e:
+#         logger.error(f"AI script generation failed for topic '{topic}': {str(e)}")
+#         raise RuntimeError(f"AI script generation failed: {e}")
 
-# # --------------------------
-# # 2) Parse Gemini output -> slides
-# # --------------------------
 # def parse_script(script_text, topic):
 #     slides = []
-#     # intro slide
-#     slides.append({
-#         "title": topic,
-#         "content": "• In this video we'll break the topic into easy steps.\n• Follow along.",
-#         "narration": f"Let's talk about {topic} in a simple and calm way. We'll go step by step."
-#     })
 
-#     parts = re.split(r"Segment \d+:", script_text, flags=re.IGNORECASE)
-#     for section in parts:
-#         lines = [l.strip() for l in section.splitlines() if l.strip()]
+#     # Intro slide (static)
+#     intro_title = f"Hello Guys, in this video we will see {topic} ✨"
+#     intro_content = (
+#         "• We’ll go through the steps in a simple way.\n"
+#         "• Just watch till the end and follow along."
+#     )
+#     slides.append({'title': intro_title, 'content': intro_content})
+
+#     # Split on "Step X:"
+#     sections = re.split(r"Step \d+:", script_text, flags=re.IGNORECASE)
+#     parsed_sections = sections[1:]  # first split part is before Step 1, ignore
+
+#     if not parsed_sections:
+#         logger.error("No valid steps parsed from AI script.")
+#         slides.append({
+#             'title': "AI Scripting Error",
+#             'content': "Failed to generate a valid script. Please try again."
+#         })
+#         return slides
+
+#     for i, section in enumerate(parsed_sections):
+#         # section looks like: " Title text\nExplanation sentences..."
+#         lines = section.strip().split("\n", 1)
 #         if len(lines) < 2:
 #             continue
-#         raw_title = lines[0].replace("[", "").replace("]", "").strip()
-#         narration = ""
-#         for l in lines[1:]:
-#             if l.lower().startswith("narration:"):
-#                 narration = l[len("narration:"):].strip()
-#                 break
-#         if not narration:
-#             narration = lines[-1]
-#         # make bullets for onscreen content
-#         sentences = re.split(r"(?<=[.!?])\s+", narration)
-#         bullets = [f"• {s.strip()}" for s in sentences if s.strip()]
-#         content = "\n".join(bullets)
-#         slides.append({"title": raw_title, "content": content, "narration": narration})
+
+#         step_title_text = lines[0].strip()
+#         raw_content = lines[1].strip()
+
+#         # Step title with a little flare
+#         title = f"Step {i+1}: {step_title_text} ✨"
+
+#         # Break explanation into bullet points for slides (but not for audio)
+#         points = [p.strip() for p in re.split(r'[.!?]\s+', raw_content) if p.strip()]
+#         content = "\n".join([
+#             f"• {p}{'.' if not p.endswith(('.', '!', '?')) else ''}"
+#             for p in points
+#         ])
+
+#         slides.append({'title': title, 'content': content})
+
+#     logger.debug(f"Parsed {len(slides)} total slides.")
 #     return slides
 
-# # --------------------------
-# # 3) TTS helpers (MMS VITS)
-# # --------------------------
-# def load_tts(lang):
-#     if lang not in MODELS:
-#         model_name = "facebook/mms-tts-hin" if lang == "hi" else "facebook/mms-tts-eng"
-#         logger.info(f"Loading TTS model: {model_name}")
-#         MODELS[lang] = {
-#             "model": VitsModel.from_pretrained(model_name),
-#             "tokenizer": AutoTokenizer.from_pretrained(model_name)
-#         }
-#     return MODELS[lang]["model"], MODELS[lang]["tokenizer"]
+# #
+# # ==================================================================
+# # === Image Generation Functions (Helpers) ===
+# # ==================================================================
+# #
+# def get_font_path(font_size=60):
+#     font_paths = [
+#         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+#         "/System/Library/Fonts/HelveticaNeue.ttc",
+#         os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "arial.ttf"),
+#         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+#     ]
+#     font_path = next((path for path in font_paths if os.path.exists(path)), None)
+#     try:
+#         if font_path:
+#             font = ImageFont.truetype(font_path, font_size)
+#         else:
+#             font = ImageFont.load_default()
+#     except Exception:
+#         font = ImageFont.load_default()
+#         logger.warning("Font loading failed. Using default.")
+#     return font, font_path
 
+# def draw_text_in_box(draw, text, box_bounds, font_size=60):
+#     font, font_path = get_font_path(font_size)
+#     title, content = text.split("\n\n", 1) if "\n\n" in text else (text, "")
+
+#     y_start_offset = box_bounds[1] + 40
+#     x_left_offset = box_bounds[0] + 40
+#     x_right_limit = box_bounds[2] - 40
+#     box_width = x_right_limit - x_left_offset
+
+#     current_font_size = font_size
+#     final_font = font
+
+#     while current_font_size >= 25:
+#         try:
+#             temp_font = ImageFont.truetype(font_path, current_font_size) if font_path else ImageFont.load_default()
+#         except Exception:
+#             temp_font = ImageFont.load_default()
+
+#         title_width_char = int(box_width / (current_font_size * 0.45))
+#         content_width_char = int(box_width / (current_font_size * 0.4))
+#         if title_width_char <= 0 or content_width_char <= 0:
+#             current_font_size -= 2
+#             continue
+
+#         wrapped_title_lines = textwrap.wrap(title, width=title_width_char)
+#         wrapped_content_lines = [
+#             line for p in content.split('\n')
+#             for line in textwrap.wrap(p, width=content_width_char)
+#         ]
+
+#         total_text_height = 0
+#         for line in wrapped_title_lines:
+#             bbox = draw.textbbox((0, 0), line, font=temp_font)
+#             total_text_height += (bbox[3] - bbox[1]) + 15
+
+#         total_text_height += 30
+
+#         for line in wrapped_content_lines:
+#             bbox = draw.textbbox((0, 0), line, font=temp_font)
+#             total_text_height += (bbox[3] - bbox[1]) + 10
+
+#         if (y_start_offset + total_text_height + 40) < box_bounds[3]:
+#             final_font = temp_font
+#             break
+
+#         current_font_size -= 2
+
+#     title_width_char = int(box_width / (current_font_size * 0.45))
+#     content_width_char = int(box_width / (current_font_size * 0.4))
+#     wrapped_title_lines = textwrap.wrap(title, width=title_width_char)
+#     wrapped_content_lines = [
+#         line for p in content.split('\n')
+#         for line in textwrap.wrap(p, width=content_width_char)
+#     ]
+
+#     y_text_current = y_start_offset
+
+#     # Draw title
+#     for line in wrapped_title_lines:
+#         try:
+#             text_width = draw.textlength(line, font=final_font)
+#         except Exception:
+#             bbox = draw.textbbox((0, 0), line, font=final_font)
+#             text_width = bbox[2] - bbox[0]
+
+#         x_centered = x_left_offset + (box_width - text_width) // 2
+#         draw.text((x_centered + 3, y_text_current + 3), line, font=final_font, fill=(80, 80, 80))
+#         draw.text((x_centered, y_text_current), line, font=final_font, fill='black')
+
+#         bbox = draw.textbbox((0, 0), line, font=final_font)
+#         y_text_current += (bbox[3] - bbox[1]) + 15
+
+#     y_text_current += 30
+
+#     # Draw content
+#     for line in wrapped_content_lines:
+#         draw.text((x_left_offset + 3, y_text_current + 3), line, font=final_font, fill=(100, 100, 100))
+#         draw.text((x_left_offset, y_text_current), line, font=final_font, fill='black')
+#         bbox = draw.textbbox((0, 0), line, font=final_font)
+#         y_text_current += (bbox[3] - bbox[1]) + 10
+
+# def create_base_image(image_paths_bg, size=(1920, 1080)):
+#     """Creates the base layer, either a blurred BG or a gradient."""
+#     if image_paths_bg:
+#         chosen_image_path = random.choice(image_paths_bg)
+#         img = Image.open(chosen_image_path).convert('RGB')
+#         img = img.resize(size, Image.Resampling.LANCZOS)
+#         img = img.filter(ImageFilter.GaussianBlur(radius=10))
+#     else:
+#         start_color = (255, 255, 255)
+#         end_color = (240, 248, 255)
+#         img = Image.new('RGB', size, color=start_color)
+#         draw = ImageDraw.Draw(img)
+#         for y in range(size[1]):
+#             r, g, b = [
+#                 int(start_color[i] + (end_color[i] - start_color[i]) * y / size[1])
+#                 for i in range(3)
+#             ]
+#             draw.line([(0, y), (size[0], y)], fill=(r, g, b), width=1)
+#     return img
+
+# def draw_text_box(img, box_bounds, radius=20):
+#     """Draws the white rounded rectangle for text."""
+#     temp_img = Image.new('RGBA', img.size, (0, 0, 0, 0))
+#     temp_draw = ImageDraw.Draw(temp_img)
+
+#     shadow_bounds = (
+#         box_bounds[0] + 10,
+#         box_bounds[1] + 10,
+#         box_bounds[2] + 10,
+#         box_bounds[3] + 10
+#     )
+#     temp_draw.rounded_rectangle(
+#         shadow_bounds,
+#         radius=radius,
+#         fill=(200, 200, 200, 150)
+#     )
+#     temp_draw.rounded_rectangle(
+#         box_bounds,
+#         radius=radius,
+#         fill=(255, 255, 255, 230)
+#     )
+#     return Image.alpha_composite(img.convert('RGBA'), temp_img).convert('RGB')
+
+# def create_text_image_sidebyside(text, image_paths_side, image_paths_bg, size=(1920, 1080), font_size=60):
+#     try:
+#         img = create_base_image(image_paths_bg, size)
+
+#         padding, gap, border_radius = 100, 75, 25
+#         text_width_percent = 0.55
+#         total_content_width = size[0] - (2 * padding) - gap
+#         text_box_width = int(total_content_width * text_width_percent)
+#         img_box_width = total_content_width - text_box_width
+#         box_y, box_height = padding, size[1] - (2 * padding)
+
+#         if random.choice([True, False]):
+#             img_box_x = padding
+#             text_box_x = padding + img_box_width + gap
+#         else:
+#             text_box_x = padding
+#             img_box_x = padding + text_box_width + gap
+
+#         text_box_bounds = (text_box_x, box_y, text_box_x + text_box_width, box_y + box_height)
+#         img_box_bounds = (img_box_x, box_y, img_box_x + img_box_width, box_y + box_height)
+
+#         # Draw Image Box (from side images)
+#         if image_paths_side:
+#             img_to_paste_path = random.choice(image_paths_side)
+#             img_to_paste = Image.open(img_to_paste_path).convert('RGB')
+
+#             img_ratio = img_to_paste.width / img_to_paste.height
+#             box_ratio = img_box_width / box_height
+
+#             if img_ratio > box_ratio:
+#                 new_height = box_height
+#                 new_width = int(new_height * img_ratio)
+#                 img_to_paste = img_to_paste.resize((new_width, new_height), Image.Resampling.LANCZOS)
+#                 crop_x = (new_width - img_box_width) // 2
+#                 img_to_paste = img_to_paste.crop((crop_x, 0, crop_x + img_box_width, new_height))
+#             else:
+#                 new_width = img_box_width
+#                 new_height = int(new_width / img_ratio)
+#                 img_to_paste = img_to_paste.resize((new_width, new_height), Image.Resampling.LANCZOS)
+#                 crop_y = (new_height - box_height) // 2
+#                 img_to_paste = img_to_paste.crop((0, crop_y, new_width, crop_y + box_height))
+
+#             img_mask = Image.new('L', (img_box_width, box_height), 0)
+#             ImageDraw.Draw(img_mask).rounded_rectangle(
+#                 (0, 0, img_box_width, box_height),
+#                 radius=border_radius,
+#                 fill=255
+#             )
+#             img.paste(img_to_paste, img_box_bounds, mask=img_mask)
+
+#         img = draw_text_box(img, text_box_bounds, border_radius)
+#         draw_text_in_box(ImageDraw.Draw(img), text, text_box_bounds, font_size)
+
+#         return img.resize((1280, 720), Image.Resampling.LANCZOS)
+#     except Exception as e:
+#         logger.error(f"Failed to create side-by-side image: {str(e)}")
+#         raise RuntimeError(f"Failed to create side-by-side image: {e}")
+
+# def create_text_image_background(text, image_paths_bg, size=(1920, 1080), font_size=60):
+#     try:
+#         img = create_base_image(image_paths_bg, size)
+#         padding = 75
+#         border_radius = 20
+#         text_box_bounds = (padding, padding, size[0] - padding, size[1] - padding)
+
+#         img = draw_text_box(img, text_box_bounds, border_radius)
+#         draw_text_in_box(ImageDraw.Draw(img), text, text_box_bounds, font_size)
+
+#         return img.resize((1280, 720), Image.Resampling.LANCZOS)
+#     except Exception as e:
+#         logger.error(f"Failed to create background image: {str(e)}")
+#         raise RuntimeError(f"Failed to create background image: {e}")
+
+# #
+# # ==================================================================
+# # === TEXT PREPROCESSING FOR TTS (Auto Pause Injection)
+# # ==================================================================
+# #
 # def preprocess_text_for_tts(text: str) -> str:
+#     """
+#     Make text more natural for MMS TTS:
+#     - Remove bullet characters
+#     - Normalize spaces
+#     - Automatically inject pauses using patterns that MMS TTS responds to:
+#       * short pause   -> ','
+#       * medium pause  -> ' - '
+#       * long pause    -> '. .' (extra period)
+#     """
+#     # Remove bullet points for audio
 #     text = text.replace("•", " ")
-#     text = re.sub(r"\s+", " ", text).strip()
-#     # short pause: comma; medium: " - "; long: ". ."
+
+#     # Collapse whitespace
+#     text = re.sub(r'\s+', ' ', text).strip()
+
+#     # Inject medium pauses after commas
 #     text = text.replace(", ", ", - ")
+
+#     # Inject long pauses between sentences
 #     text = text.replace(". ", ". . ")
 #     text = text.replace("? ", "? . ")
 #     text = text.replace("! ", "! . ")
+
 #     return text
 
-# def humanize_audio(audio: AudioSegment) -> AudioSegment:
-#     # Compression
-#     try:
-#         audio = audio.compress_dynamic_range(threshold=-25.0, ratio=3.0, attack=5, release=50)
-#     except Exception:
-#         pass
-#     # EQ
-#     try:
-#         audio = audio.low_pass_filter(5500)
-#         audio = audio.high_pass_filter(120)
-#     except Exception:
-#         pass
-#     # Slight pitch warmth
-#     try:
-#         audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * 0.975)}).set_frame_rate(audio.frame_rate)
-#     except Exception:
-#         pass
-#     # fade in/out
-#     audio = audio.fade_in(80).fade_out(120)
-#     return audio
-
-# def create_audio_segments(slides):
+# def create_audio_segments(slides, topic_title):
 #     audio_paths = []
-#     end_pause = AudioSegment.silent(duration=350)
-   
-#     for idx, s in enumerate(slides):
-#         narration = s.get("narration", s.get("content", ""))
-#         if not narration or not narration.strip():
-#             p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
-#             AudioSegment.silent(duration=1500).export(p, format="mp3")
-#             audio_paths.append(p)
+#     pause_segment = AudioSegment.silent(duration=350)  # small natural pause at end of each slide
+
+#     for i, slide in enumerate(slides):
+#         # For audio: title + content, but content without bullets/newlines
+#         content_for_audio = slide['content'].replace("•", " ")
+#         content_for_audio = re.sub(r'\s+', ' ', content_for_audio).strip()
+
+#         script_text = f"{slide['title']}. {content_for_audio}"
+#         if not script_text or not script_text.strip():
 #             continue
-#         tts_text = preprocess_text_for_tts(narration)
-#         lang = "hi" if re.search(r"[\u0900-\u097F]", tts_text) else "en"
+
+#         # Auto-pause injection for MMS TTS
+#         script_text_for_tts = preprocess_text_for_tts(script_text)
+
+#         sanitized_topic = "".join(c for c in topic_title if c.isalnum())[:15]
+#         temp_wav_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}_temp.wav")
+#         audio_path = os.path.join(TEMP_DIR, f"{sanitized_topic}_slide{i+1}_{uuid4().hex[:8]}.mp3")
+
+#         lang = detect_language(script_text_for_tts)
+#         model, tokenizer = load_model(lang)
+
+#         inputs = tokenizer(script_text_for_tts, return_tensors="pt", padding=True, truncation=True)
+#         with torch.no_grad():
+#             outputs = model(**inputs).waveform
+
+#         waveform = outputs[0].cpu().numpy()
+#         rate = model.config.sampling_rate
+
+#         # Save raw output
+#         sf.write(temp_wav_path, waveform, rate)
+
+#         # Load into pydub for humanization
+#         audio = AudioSegment.from_wav(temp_wav_path)
+
+#         # -------------------------
+#         #  HUMANIZATION PROCESSING
+#         # -------------------------
+
+#         # 1. Slight low-pass to soften harsh robotic highs
+#         audio = audio.low_pass_filter(7000)
+
+#         # 2. Slight pitch warmth (decrease frame rate a bit)
+#         audio = audio._spawn(audio.raw_data, overrides={
+#             "frame_rate": int(audio.frame_rate * 0.94)
+#         }).set_frame_rate(audio.frame_rate)
+
+#         # 3. Speed normalization (slightly faster to feel natural)
 #         try:
-#             model, tokenizer = load_tts(lang)
-#             inputs = tokenizer(tts_text, return_tensors="pt", padding=True, truncation=True)
-#             with torch.no_grad():
-#                 out = model(**inputs).waveform
-#             wav_path = os.path.join(TEMP_DIR, f"tts_{uuid4().hex}.wav")
-#             sf.write(wav_path, out[0].cpu().numpy(), model.config.sampling_rate)
-
-#             audio = AudioSegment.from_wav(wav_path)
-#             audio = humanize_audio(audio)
-#             audio = AudioSegment.silent(duration=120) + audio + end_pause
-
-#             mp3_path = os.path.join(TEMP_DIR, f"audio_{uuid4().hex}.mp3")
-#             audio.export(mp3_path, format="mp3")
-
-#             # cleanup
-#             try:
-#                 os.remove(wav_path)
-#             except Exception:
-#                 pass
-
-#             audio_paths.append(mp3_path)
+#             audio = audio.speedup(playback_speed=1.06, chunk_size=50, crossfade=20)
 #         except Exception as e:
-#             logger.warning(f"TTS error for slide {idx}: {e}")
-#             p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
-#             AudioSegment.silent(duration=1500).export(p, format="mp3")
-#             audio_paths.append(p)
+#             logger.warning(f"Speedup failed for slide {i+1}, using original speed: {e}")
+
+#         # 4. Small "breathing" pause at start
+#         breath = AudioSegment.silent(duration=120)
+#         audio = breath + audio
+
+#         # 5. Ending pause
+#         final_audio = audio + pause_segment
+
+#         final_audio.export(audio_path, format="mp3")
+
+#         # cleanup temp wav
+#         if os.path.exists(temp_wav_path):
+#             os.remove(temp_wav_path)
+
+#         audio_paths.append(audio_path)
+#         logger.debug(f"Human-enhanced audio for slide {i+1} generated at {audio_path}")
+
 #     return audio_paths
 
-# # --------------------------
-# # 4) Visual helpers (side images fixed)
-# # --------------------------
-# def get_font(size):
-#     candidates = [
-#         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-#         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-#         "/System/Library/Fonts/HelveticaNeue.ttc",
-#         os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "arial.ttf")
-#     ]
-#     for p in candidates:
-#         if p and os.path.exists(p):
-#             try:
-#                 return ImageFont.truetype(p, size)
-#             except Exception:
+# #
+# # ==================================================================
+# # === create_video (Uses both image lists)
+# # ==================================================================
+# #
+# def create_video(slides, audio_paths, topic_title, image_paths_side, image_paths_bg):
+#     try:
+#         temp_segment_paths = []
+
+#         INTERSTITIAL_DURATION_MS = 3000
+#         silent_audio_path = os.path.join(TEMP_DIR, f"silent_audio_{uuid4().hex[:8]}.mp3")
+
+#         # Create silent audio only if background images are provided
+#         if image_paths_bg:
+#             AudioSegment.silent(duration=INTERSTITIAL_DURATION_MS).export(silent_audio_path, format="mp3")
+
+#         for i, slide in enumerate(slides):
+#             if i >= len(audio_paths):
+#                 logger.warning(f"No audio file found for slide {i+1}. Skipping.")
 #                 continue
-#     return ImageFont.load_default()
 
-# def create_slide_image(slide, side_imgs, bg_imgs, size=(1280, 720)):
-#     W, H = size
-#     # base background
-#     if bg_imgs:
-#         bg_path = random.choice(bg_imgs)
-#         bg = Image.open(bg_path).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
-#         bg = bg.filter(ImageFilter.GaussianBlur(radius=12))
-#         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 110))
-#         base = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
-#     else:
-#         base = Image.new("RGB", (W, H), (32, 34, 40))
+#             # === 1. CREATE THE MAIN SLIDE ===
+#             audio_path = audio_paths[i]
+#             slide_text = f"{slide['title']}\n\n{slide['content']}"
 
-#     draw = ImageDraw.Draw(base)
-#     # text box and layout
-#     padding = 60
-#     gap = 40
-#     text_box_width = int(W * 0.6) if side_imgs else W - 2 * padding
-#     if side_imgs:
-#         # left side image region
-#         side_w = int(W * 0.35)
-#         side_h = H - 2 * padding
-#         side_x = padding
-#         side_y = padding
-#         try:
-#             side_img = Image.open(random.choice(side_imgs)).convert("RGB")
-#             # fit & crop to box
-#             img_ratio = side_img.width / side_img.height
-#             box_ratio = side_w / side_h
-#             if img_ratio > box_ratio:
-#                 # too wide -> fit height
-#                 new_h = side_h
-#                 new_w = int(new_h * img_ratio)
-#                 side_img = side_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-#                 crop_x = (new_w - side_w) // 2
-#                 side_img = side_img.crop((crop_x, 0, crop_x + side_w, new_h))
+#             # Intelligent Layout:
+#             if image_paths_side:
+#                 image_pil = create_text_image_sidebyside(slide_text, image_paths_side, image_paths_bg)
 #             else:
-#                 new_w = side_w
-#                 new_h = int(new_w / img_ratio)
-#                 side_img = side_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-#                 crop_y = (new_h - side_h) // 2
-#                 side_img = side_img.crop((0, crop_y, new_w, crop_y + side_h))
-#             # rounded mask
-#             mask = Image.new("L", (side_w, side_h), 0)
-#             mdraw = ImageDraw.Draw(mask)
-#             radius = 20
-#             mdraw.rounded_rectangle((0, 0, side_w, side_h), radius=radius, fill=255)
-#             base.paste(side_img, (side_x, side_y), mask)
-#             # optional border
-#             draw.rounded_rectangle((side_x, side_y, side_x + side_w, side_y + side_h), radius=20, outline=(255,255,255), width=2)
-#         except Exception as e:
-#             logger.debug(f"Side image error: {e}")
+#                 image_pil = create_text_image_background(slide_text, image_paths_bg)
 
-#         text_x = side_x + side_w + gap
-#         text_box = (text_x, padding, W - padding, H - padding)
-#     else:
-#         text_box = (padding, padding, W - padding, H - padding)
+#             temp_image_path = os.path.join(TEMP_DIR, f"slide_image_{i}_{uuid4().hex[:8]}.png")
+#             image_pil.save(temp_image_path)
 
-#     # draw white rounded rectangle
-#     draw.rounded_rectangle(text_box, radius=20, fill=(255,255,255,230))
+#             audio_duration = len(AudioSegment.from_file(audio_path)) / 1000.0
 
-#     # write title + bullets inside text_box
-#     title = slide.get("title", "")
-#     content = slide.get("content", "")
+#             temp_video_clip_path = os.path.join(TEMP_DIR, f"clip_{i}_{uuid4().hex[:8]}.mp4")
+#             (
+#                 ffmpeg.input(temp_image_path, loop=1, t=audio_duration)
+#                 .output(temp_video_clip_path, vcodec='libx264', pix_fmt='yuv420p', r=24, preset='fast')
+#                 .run(overwrite_output=True, quiet=True)
+#             )
 
-#     font_title = get_font(44)
-#     font_body = get_font(30)
+#             final_segment_path = os.path.join(TEMP_DIR, f"final_segment_{i}_{uuid4().hex[:8]}.mp4")
+#             video_stream = ffmpeg.input(temp_video_clip_path)
+#             audio_stream = ffmpeg.input(audio_path)
+#             ffmpeg.output(
+#                 video_stream,
+#                 audio_stream,
+#                 final_segment_path,
+#                 vcodec='copy',
+#                 acodec='aac',
+#                 shortest=None,
+#                 strict='experimental'
+#             ).run(overwrite_output=True, quiet=True)
 
-#     tx, ty = text_box[0] + 24, text_box[1] + 24
-#     # title wrap
-#     for line in textwrap.wrap(title, width=28):
-#         draw.text((tx, ty), line, font=font_title, fill=(0,0,0))
-#         ty += int(font_title.size * 1.05) + 6
-#     ty += 8
-#     # content (bullets)
-#     for line in content.split("\n"):
-#         for wline in textwrap.wrap(line, width=48):
-#             if ty > text_box[3] - 36:
-#                 break
-#             draw.text((tx, ty), wline, font=font_body, fill=(60,60,60))
-#             ty += int(font_body.size * 1.02) + 6
+#             temp_segment_paths.append(final_segment_path)
+#             os.remove(temp_image_path)
+#             os.remove(temp_video_clip_path)
+#             logger.debug(f"Generated and synced video segment for slide {i+1}")
 
-#     return base.convert("RGB")
+#             # === 2. INTERSTITIAL (Only if BG images are provided) ===
+#             if image_paths_bg and i < len(slides) - 1:
+#                 logger.debug(f"Creating interstitial image after slide {i+1}")
 
-# # --------------------------
-# # 5) Video & FFmpeg helpers
-# # --------------------------
-# def normalize_user_video(input_path, out_path=None):
-#     """Convert user video to 1280x720 padded, 24fps, but keep original duration."""
-#     if not out_path:
-#         out_path = os.path.join(TEMP_DIR, f"norm_{uuid4().hex}.mp4")
-#     try:
-#         (
-#             ffmpeg
-#             .input(input_path)
-#             .filter('scale', 1280, 720, force_original_aspect_ratio='decrease')
-#             .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
-#             .output(out_path, vcodec='libx264', acodec='aac', r=24, ar=44100, pix_fmt='yuv420p', strict='experimental')
-#             .global_args('-loglevel', 'error')
-#             .run(overwrite_output=True)
-#         )
-#         return out_path
-#     except Exception as e:
-#         logger.error(f"normalize_user_video error: {e}")
-#         return None
+#                 chosen_image_path = random.choice(image_paths_bg)
+#                 img = Image.open(chosen_image_path).convert('RGB')
 
-# def create_intro_clip_from_user_video(user_video_path, intro_audio_path, trim_to_audio=True):
-#     """
-#     For Option B:
-#     - Trim user_video to match intro audio duration (if trim_to_audio True)
-#     - Mute user_video
-#     - Overlay intro_audio_path as audio track
-#     - Return generated clip path
-#     """
-#     try:
-#         # ensure normalized size
-#         norm_path = os.path.join(TEMP_DIR, f"norm_{uuid4().hex}.mp4")
-#         norm = normalize_user_video(user_video_path, out_path=norm_path)
-#         if not norm:
-#             return None
+#                 img_ratio = img.width / img.height
+#                 box_ratio = 1920 / 1080
+#                 if img_ratio > box_ratio:
+#                     new_height = 1080
+#                     new_width = int(new_height * img_ratio)
+#                     img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+#                     crop_x = (new_width - 1920) // 2
+#                     img = img.crop((crop_x, 0, crop_x + 1920, 1080))
+#                 else:
+#                     new_width = 1920
+#                     new_height = int(new_width / img_ratio)
+#                     img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+#                     crop_y = (new_height - 1080) // 2
+#                     img = img.crop((0, crop_y, 1920, crop_y + 1080))
 
-#         # duration of TTS audio
-#         audio_dur = AudioSegment.from_file(intro_audio_path).duration_seconds
-#         if trim_to_audio:
-#             t = audio_dur
-#         else:
-#             # use full user video duration
-#             # get via ffprobe? get pydub
-#             t = AudioSegment.from_file(user_video_path).duration_seconds
+#                 img = img.resize((1280, 720), Image.Resampling.LANCZOS)
+#                 temp_interstitial_img_path = os.path.join(TEMP_DIR, f"interstitial_img_{i}_{uuid4().hex[:8]}.png")
+#                 img.save(temp_interstitial_img_path)
 
-#         out_path = os.path.join(TEMP_DIR, f"intro_clip_{uuid4().hex}.mp4")
-#         # build streams separately
-#         vid_stream = ffmpeg.input(norm, ss=0, t=t)
-#         aud_stream = ffmpeg.input(intro_audio_path)
-#         # output: use video from user (muted), audio from intro
-#         (
-#             ffmpeg
-#             .output(vid_stream, aud_stream, out_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', r=24, shortest=None)
-#             .global_args('-loglevel', 'error')
-#             .run(overwrite_output=True)
-#         )
-#         # cleanup normalized copy
+#                 temp_interstitial_video_path = os.path.join(TEMP_DIR, f"interstitial_video_{i}_{uuid4().hex[:8]}.mp4")
+#                 (
+#                     ffmpeg.input(temp_interstitial_img_path, loop=1, t=(INTERSTITIAL_DURATION_MS / 1000.0))
+#                     .output(temp_interstitial_video_path, vcodec='libx264', pix_fmt='yuv420p', r=24, preset='fast')
+#                     .run(overwrite_output=True, quiet=True)
+#                 )
+
+#                 final_interstitial_segment_path = os.path.join(TEMP_DIR, f"final_interstitial_{i}_{uuid4().hex[:8]}.mp4")
+#                 video_stream = ffmpeg.input(temp_interstitial_video_path)
+#                 audio_stream = ffmpeg.input(silent_audio_path)
+#                 ffmpeg.output(
+#                     video_stream,
+#                     audio_stream,
+#                     final_interstitial_segment_path,
+#                     vcodec='copy',
+#                     acodec='aac',
+#                     shortest=None,
+#                     strict='experimental'
+#                 ).run(overwrite_output=True, quiet=True)
+
+#                 temp_segment_paths.append(final_interstitial_segment_path)
+#                 os.remove(temp_interstitial_img_path)
+#                 os.remove(temp_interstitial_video_path)
+
+#         if not temp_segment_paths:
+#             raise RuntimeError("No synchronized video segments were created.")
+
+#         # 3. Concatenate all segments
+#         sanitized_topic = "".join(c for c in topic_title if c.isalnum())[:15]
+#         concat_list_path = os.path.join(TEMP_DIR, f"concat_list_{sanitized_topic}_{uuid4().hex[:8]}.txt")
+
+#         with open(concat_list_path, 'w') as f:
+#             for path in temp_segment_paths:
+#                 f.write(f"file '{os.path.basename(path)}'\n")
+
+#         final_video_path = os.path.join(OUTPUT_DIR, f"{sanitized_topic}_{uuid4().hex[:8]}.mp4")
+
+#         current_dir = os.getcwd()
+#         os.chdir(TEMP_DIR)
 #         try:
-#             os.remove(norm)
-#         except:
-#             pass
-#         return out_path
+#             (
+#                 ffmpeg.input(os.path.basename(concat_list_path), f='concat', safe=0)
+#                 .output(os.path.join(current_dir, final_video_path), c='copy')
+#                 .run(overwrite_output=True, quiet=True)
+#             )
+#         finally:
+#             os.chdir(current_dir)
+
+#         # 4. Clean up
+#         files_to_clean = temp_segment_paths + audio_paths + [os.path.join(TEMP_DIR, os.path.basename(concat_list_path))]
+#         if image_paths_bg and os.path.exists(silent_audio_path):
+#             files_to_clean.append(silent_audio_path)
+
+#         for path in files_to_clean:
+#             if os.path.exists(path):
+#                 try:
+#                     os.remove(path)
+#                 except Exception as e:
+#                     logger.warning(f"Failed to delete temp file {path}: {str(e)}")
+
+#         logger.info(f"Final video created successfully at: {final_video_path}")
+#         return final_video_path
+
 #     except Exception as e:
-#         logger.error(f"create_intro_clip_from_user_video error: {e}")
-#         return None
+#         logger.error(f"Failed to create final video for topic '{topic_title}': {str(e)}")
+#         raise RuntimeError(f"Failed to create video: {e}")
 
-# def make_slide_video(image_path, audio_path, out_path):
-#     """
-#     Create a video from a static image and an audio file.
-#     Use separate ffmpeg inputs to avoid FilterableStream errors.
-#     """
+# # === Task Management Thread ===
+# def generate_videos_and_zip(task_id, topics, image_paths_side, image_paths_bg):
+#     global MODELS
+#     tasks[task_id]['failed_topics'] = []
+
 #     try:
-#         dur = AudioSegment.from_file(audio_path).duration_seconds
-#     except Exception:
-#         dur = None
-
-#     img_stream = ffmpeg.input(image_path, loop=1, t=dur if dur else None)
-#     aud_stream = ffmpeg.input(audio_path)
-#     (
-#         ffmpeg
-#         .output(img_stream, aud_stream, out_path, vcodec='libx264', acodec='aac', pix_fmt='yuv420p', r=24)
-#         .global_args('-loglevel', 'error')
-#         .run(overwrite_output=True)
-#     )
-#     return out_path
-
-# # --------------------------
-# # 6) Task runner (main flow)
-# # --------------------------
-# def run_task(task_id, topics, side_imgs, bg_imgs, uploaded_intro_video_path=None):
-#     try:
-#         results = []
-#         # Pre-normalize intro video once if provided
-#         normalized_intro_src = None
-#         if uploaded_intro_video_path:
-#             normalized_intro_src = normalize_user_video(uploaded_intro_video_path)
+#         generated_video_paths = []
 
 #         for topic in topics:
 #             logger.info(f"Processing topic: {topic}")
-#             # 1. generate script and parse
-#             script = generate_script(topic)
-#             slides = parse_script(script, topic)
-
-#             # 2. create TTS audios for all slides
-#             audios = create_audio_segments(slides)
-#             # If audios shorter than slides, fill with silence
-#             while len(audios) < len(slides):
-#                 p = os.path.join(TEMP_DIR, f"silence_{uuid4().hex}.mp3")
-#                 AudioSegment.silent(duration=1500).export(p, format="mp3")
-#                 audios.append(p)
-
-#             # 3. prepare intro clip (use first slide audio) -> match duration and mute
-#             intro_audio = audios[0]  # first slide narration
-#             intro_clip = None
-#             if normalized_intro_src:
-#                 intro_clip = create_intro_clip_from_user_video(normalized_intro_src, intro_audio, trim_to_audio=True)
-#             else:
-#                 # If no uploaded video, create a quick image-based intro fallback
-#                 img_intro = create_slide_image(slides[0], side_imgs, bg_imgs)
-#                 img_path = os.path.join(TEMP_DIR, f"intro_img_{uuid4().hex}.png")
-#                 img_intro.save(img_path)
-#                 intro_clip_tmp = os.path.join(TEMP_DIR, f"intro_tmp_{uuid4().hex}.mp4")
-#                 make_slide_video(img_path, intro_audio, intro_clip_tmp)
-#                 intro_clip = intro_clip_tmp
-#                 try:
-#                     os.remove(img_path)
-#                 except: pass
-
-#             # 4. make slide videos
-#             slide_vids = []
-          
-#             for i, slide in enumerate(slides):
-#                 image = create_slide_image(slide, side_imgs, bg_imgs)
-#                 img_path = os.path.join(TEMP_DIR, f"{uuid4().hex}.png")
-#                 image.save(img_path)
-#                 vid_path = os.path.join(TEMP_DIR, f"{uuid4().hex}.mp4")
-#                 make_slide_video(img_path, audios[i], vid_path)
-#                 slide_vids.append(vid_path)
-#                 # cleanup image
-#                 try:
-#                     os.remove(img_path)
-#                 except:
-#                     pass
-
-#             # 5. build final sequence: intro + slides
-#             sequence = []
-#             if intro_clip:
-#                 sequence.append(intro_clip)
-#             sequence.extend(slide_vids)
-
-#             # safe concat: move/rename clips into TEMP with safe names
-#             concat_list_path = os.path.join(TEMP_DIR, f"concat_{uuid4().hex}.txt")
-#             with open(concat_list_path, "w", encoding="utf-8") as f:
-#                 for clip in sequence:
-#                     # make safe name
-#                     raw = os.path.basename(clip)
-#                     safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
-#                     dest = os.path.join(TEMP_DIR, safe)
-#                     try:
-#                         if os.path.abspath(clip) != os.path.abspath(dest):
-#                             shutil.move(clip, dest)
-#                         else:
-#                             dest = clip
-#                     except Exception:
-#                         # fallback to copying
-#                         try:
-#                             shutil.copy2(clip, dest)
-#                         except Exception as e:
-#                             logger.warning(f"Could not move or copy clip {clip} to {dest}: {e}")
-#                     f.write(f"file {safe}\n")
-
-#             # run concat
-#             out_file = os.path.join(OUTPUT_DIR, f"{slugify(topic, 40)}_{uuid4().hex[:6]}.mp4")
-#             cwd = os.getcwd()
-#             os.chdir(TEMP_DIR)
 #             try:
-#                 (
-#                     ffmpeg
-#                     .input(os.path.basename(concat_list_path), format="concat", safe=0)
-#                     .output(os.path.join(cwd, out_file), c="copy")
-#                     .global_args("-loglevel", "error")
-#                     .run(overwrite_output=True)
-#                 )
+#                 script = generate_script_with_ai(topic)
+#                 slides = parse_script(script, topic)
+#                 audio_paths = create_audio_segments(slides, topic)
+#                 video_path = create_video(slides, audio_paths, topic, image_paths_side, image_paths_bg)
+#                 generated_video_paths.append(video_path)
+#                 logger.info(f"Successfully generated video for topic: {topic}")
+#             except Exception as e:
+#                 logger.error(f"Failed to process topic '{topic}': {str(e)}")
+#                 tasks[task_id]['failed_topics'].append({'topic': topic, 'error': str(e)})
+#                 if 'audio_paths' in locals():
+#                     for path in audio_paths:
+#                         if os.path.exists(path):
+#                             os.remove(path)
+#                 continue
 #             finally:
-#                 os.chdir(cwd)
+#                 # clear loaded models to free RAM between topics
+#                 MODELS.clear()
 
-#             results.append(out_file)
-#             logger.info(f"Generated: {out_file}")
+#         if not generated_video_paths:
+#             logger.error(f"No videos generated for task {task_id}")
+#             tasks[task_id]['status'] = 'failed'
+#             tasks[task_id]['error'] = 'No videos were generated successfully'
+#             return
 
-#             # cleanup per-topic audio files
-#             for a in audios:
+#         # Zipping
+#         zip_file_path = os.path.join(OUTPUT_DIR, f"{task_id}.zip")
+#         with zipfile.ZipFile(zip_file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+#             for video_path in generated_video_paths:
+#                 if os.path.exists(video_path):
+#                     zipf.write(video_path, os.path.basename(video_path))
+
+#         # Cleanup videos
+#         for video_path in generated_video_paths:
+#             if os.path.exists(video_path):
 #                 try:
-#                     os.remove(a)
-#                 except:
-#                     pass
+#                     os.remove(video_path)
+#                 except Exception as e:
+#                     logger.warning(f"Failed to delete video file {video_path}: {str(e)}")
 
-#             # leave final clip(s) in TEMP (they moved) — don't delete slides we moved
-#             try:
-#                 os.remove(concat_list_path)
-#             except:
-#                 pass
+#         tasks[task_id]['status'] = 'completed'
+#         tasks[task_id]['zip_file_path'] = zip_file_path
+#         logger.info(f"Task {task_id} completed successfully")
 
-#         # zip results
-#         zip_path = os.path.join(OUTPUT_DIR, f"{task_id}.zip")
-#         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-#             for r in results:
-#                 zf.write(r, os.path.basename(r))
-#         tasks[task_id]["status"] = "completed"
-#         tasks[task_id]["zip"] = zip_path
-#         tasks[task_id]["videos"] = results
-#         logger.info(f"Task {task_id} completed successfully.")
 #     except Exception as e:
-#         logger.exception("run_task failed")
-#         tasks[task_id]["status"] = "failed"
-#         tasks[task_id]["error"] = str(e)
+#         logger.error(f"Fatal error generating videos for task {task_id}: {str(e)}")
+#         tasks[task_id]['status'] = 'failed'
+#         tasks[task_id]['error'] = f"Fatal task failure: {str(e)}"
 
-# # --------------------------
-# # 7) Routes
-# # --------------------------
-# @app.route("/generate-bulk-videos", methods=["POST"])
-# def generate_bulk():
-#     # topics = JSON array in form data 'topics'
+#     finally:
+#         # Cleanup ALL uploaded images
+#         all_image_paths = image_paths_side + image_paths_bg
+#         for img_path in all_image_paths:
+#             if os.path.exists(img_path):
+#                 try:
+#                     os.remove(img_path)
+#                 except Exception as e:
+#                     logger.warning(f"Failed to delete uploaded image {img_path}: {str(e)}")
+
+# #
+# # ==================================================================
+# # === API Endpoint (Accepts two image lists)
+# # ==================================================================
+# #
+# @app.route('/generate-bulk-videos', methods=['POST'])
+# def handle_generate_bulk_videos():
+#     def save_files(file_list):
+#         """Helper to save a list of files and return their paths."""
+#         paths = []
+#         for file in file_list:
+#             if file and file.filename:
+#                 try:
+#                     filename = secure_filename(file.filename)
+#                     save_path = os.path.join(UPLOADS_DIR, f"{uuid4().hex}_{filename}")
+#                     file.save(save_path)
+#                     paths.append(save_path)
+#                 except Exception as e:
+#                     logger.warning(f"Failed to save uploaded file {file.filename}: {e}")
+#         return paths
+
+#     # 1. Get topics string
+#     topics_str = request.form.get('topics')
+#     if not topics_str:
+#         return jsonify({'error': 'A list of topics is required.'}), 400
 #     try:
-#         topics = json.loads(request.form.get("topics", "[]"))
-#     except Exception:
-#         return jsonify({"error": "Invalid topics format"}), 400
+#         topics = json.loads(topics_str)
+#         if not topics or not isinstance(topics, list) or not all(isinstance(t, str) for t in topics):
+#             raise ValueError("Invalid topics format")
+#     except Exception as e:
+#         return jsonify({'error': 'Invalid topics format. Must be a JSON list of strings.'}), 400
+#     logger.info(f"Received topics: {topics}")
 
-#     # save uploaded side/bg images and uploaded intro video (single)
-#     def save_files(key):
-#         arr = []
-#         for f in request.files.getlist(key):
-#             if f and f.filename:
-#                 path = os.path.join(UPLOADS_DIR, f"{uuid4().hex}_{secure_filename(f.filename)}")
-#                 f.save(path)
-#                 arr.append(path)
-#         return arr
+#     # 2. Get image files from both lists
+#     image_files_side = request.files.getlist('images_side')
+#     image_files_bg = request.files.getlist('images_bg')
 
-#     side_imgs = save_files("images_side")
-#     bg_imgs = save_files("images_bg")
-#     # support single uploaded intro video field name 'intro_video'
-#     intro_videos = save_files("intro_video")
-#     uploaded_intro = intro_videos[0] if intro_videos else None
+#     image_paths_side = save_files(image_files_side)
+#     image_paths_bg = save_files(image_files_bg)
 
-#     # create task
-#     task_id = uuid4().hex
-#     tasks[task_id] = {"status": "processing"}
-#     # start background thread: every topic uses the same uploaded_intro (trimmed)
-#     threading.Thread(target=run_task, args=(task_id, topics, side_imgs, bg_imgs, uploaded_intro), daemon=True).start()
-#     return jsonify({"task_id": task_id})
+#     if image_paths_side:
+#         logger.info(f"Saved {len(image_paths_side)} side images.")
+#     if image_paths_bg:
+#         logger.info(f"Saved {len(image_paths_bg)} background images.")
+#     if not image_paths_side and not image_paths_bg:
+#         logger.info("No images uploaded. Proceeding with default gradient backgrounds.")
 
-# @app.route("/check-status/<task_id>")
+#     task_id = str(uuid4())
+#     tasks[task_id] = {'status': 'processing', 'topics': topics}
+
+#     # 3. Start thread with both image lists
+#     threading.Thread(
+#         target=generate_videos_and_zip,
+#         args=(task_id, topics, image_paths_side, image_paths_bg),
+#         daemon=True
+#     ).start()
+
+#     return jsonify({'task_id': task_id, 'message': 'Video generation started.'})
+
+# @app.route('/check-status/<task_id>', methods=['GET'])
 # def check_status(task_id):
-#     return jsonify(tasks.get(task_id, {"status": "not_found"}))
+#     task = tasks.get(task_id)
+#     if not task:
+#         return jsonify({'error': 'Task not found.'}), 404
+#     display_task = task.copy()
+#     display_task.pop('zip_file_path', None)
+#     return jsonify(display_task)
 
-# @app.route("/download/<task_id>")
-# def download(task_id):
-#     t = tasks.get(task_id)
-#     if not t:
-#         return "", 404
-#     if t.get("status") != "completed":
-#         return jsonify(t), 400
-#     zip_path = t.get("zip")
-#     if not zip_path or not os.path.exists(zip_path):
-#         return "", 404
-#     return send_file(zip_path, as_attachment=True)
+# @app.route('/download/<task_id>', methods=['GET'])
+# def download_zip(task_id):
+#     task = tasks.get(task_id)
+#     if not task or task['status'] != 'completed':
+#         return jsonify({'error': 'File not found or generation not complete.'}), 404
+#     zip_file_path = task['zip_file_path']
+#     if not os.path.exists(zip_file_path):
+#         return jsonify({'error': 'Zip file not found.'}), 404
+#     return send_file(
+#         zip_file_path,
+#         as_attachment=True,
+#         mimetype='application/zip',
+#         download_name=f"generated_videos_{task_id}.zip"
+#     )
 
-# @app.route("/cleanup/<task_id>", methods=["POST"])
+# @app.route('/cleanup/<task_id>', methods=['POST'])
 # def cleanup(task_id):
-#     t = tasks.get(task_id)
-#     if not t:
-#         return jsonify({"status": "not_found"})
-#     # remove zip and output video files
-#     try:
-#         zipf = t.get("zip")
-#         vids = t.get("videos", [])
-#         if zipf and os.path.exists(zipf):
-#             os.remove(zipf)
-#         for v in vids:
-#             try:
-#                 os.remove(v)
-#             except:
-#                 pass
-#     except Exception as e:
-#         logger.warning(f"cleanup issue: {e}")
-#     del tasks[task_id]
-#     return jsonify({"status": "ok"})
+#     task = tasks.get(task_id)
+#     if task and task.get('zip_file_path') and os.path.exists(task['zip_file_path']):
+#         try:
+#             os.remove(task['zip_file_path'])
+#             logger.info(f"Cleaned up zip file for task {task_id}")
+#         except Exception as e:
+#             logger.warning(f"Failed to delete zip file {task['zip_file_path']}: {str(e)}")
+#     tasks.pop(task_id, None)
+#     return jsonify({'message': 'Cleanup completed.'})
 
-# # --------------------------
-# # 8) Run server
-# # --------------------------
-# if __name__ == "__main__":
-#     logger.info("Starting bulk video generator API...")
-#     logger.info("Make sure ffmpeg is installed and GEMINI_API_KEY is set.")
-#     app.run(host="0.0.0.0", port=8000, debug=True)
+# if __name__ == '__main__':
+#     logger.info("--- REQUIREMENTS ---")
+#     logger.info(">>> CRITICAL: Ensure Gemini API key is valid. <<<")
+#     logger.info("Ensure all Python packages are installed: flask, pydub, google-generativeai, transformers, torch, soundfile, pillow, ffmpeg-python.")
+#     logger.info("Ensure FFmpeg is installed and accessible in your system's PATH.")
+#     logger.info("--------------------")
+
+#     app.run(host='0.0.0.0', port=8000, debug=True, use_reloader=False)
+
+
+
+// import { useState, useEffect } from 'react';
+// import { Sparkles, Loader2, Video, CheckCircle, Download, FileImage, LayoutPanelLeft, PictureInPicture } from 'lucide-react';
+// import './App.css';
+
+// const App = () => {
+//   const [topicsText, setTopicsText] = useState('');
+//   // NEW: Two separate states for image files
+//   const [sideImageFiles, setSideImageFiles] = useState([]);
+//   const [bgImageFiles, setBgImageFiles] = useState([]); 
+  
+//   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+//   const [videoDownloadUrl, setVideoDownloadUrl] = useState('');
+//   const [error, setError] = useState('');
+//   const [taskId, setTaskId] = useState(null);
+
+//   const serverUrl = 'http://localhost:8000'; // Your backend server URL
+
+//   // NEW: Handlers for each file input
+//   const handleSideImageChange = (e) => {
+//     setSideImageFiles(e.target.files);
+//   };
+//   const handleBgImageChange = (e) => {
+//     setBgImageFiles(e.target.files);
+//   };
+
+//   const handleGenerateVideo = async () => {
+//     const topics = topicsText.split('\n').map(t => t.trim()).filter(t => t.length > 0);
+//     if (topics.length === 0) {
+//       setError('Please paste at least one topic.');
+//       return;
+//     }
+
+//     setIsGeneratingVideo(true);
+//     setError('');
+//     setVideoDownloadUrl('');
+//     setTaskId(null);
+
+//     const formData = new FormData();
+//     formData.append('topics', JSON.stringify(topics));
+
+//     // NEW: Append both image lists separately
+//     Array.from(sideImageFiles).forEach(file => {
+//       formData.append('images_side', file); // Note the name 'images_side'
+//     });
+//     Array.from(bgImageFiles).forEach(file => {
+//       formData.append('images_bg', file); // Note the name 'images_bg'
+//     });
+
+//     try {
+//       const response = await fetch(`${serverUrl}/generate-bulk-videos`, {
+//         method: 'POST',
+//         body: formData,
+//       });
+
+//       if (!response.ok) {
+//         const errResult = await response.json();
+//         throw new Error(errResult.error || 'Failed to initiate video generation.');
+//       }
+
+//       const { task_id } = await response.json();
+//       setTaskId(task_id);
+//     } catch (err) {
+//       console.error(err);
+//       setError(`Failed to start video generation: ${err.message}`);
+//       setIsGeneratingVideo(false);
+//     }
+//   };
+
+//   // ... (useEffect for polling is unchanged) ...
+//   useEffect(() => {
+//     if (!taskId) return;
+//     const pollStatus = async () => {
+//       try {
+//         const response = await fetch(`${serverUrl}/check-status/${taskId}`);
+//         if (!response.ok) throw new Error('Failed to check status.');
+//         const task = await response.json();
+//         if (task.status === 'completed') {
+//           const downloadResponse = await fetch(`${serverUrl}/download/${taskId}`);
+//           if (!downloadResponse.ok) throw new Error('Failed to fetch zip file.');
+//           const blob = await downloadResponse.blob();
+//           const url = URL.createObjectURL(blob);
+//           setVideoDownloadUrl(url);
+//           setIsGeneratingVideo(false);
+//         } else if (task.status === 'failed') {
+//           throw new Error(task.error || 'Video generation failed.');
+//         } else {
+//           setTimeout(pollStatus, 2000);
+//         }
+//       } catch (err) {
+//         console.error(err);
+//         setError(`Error during video generation: ${err.message}`);
+//         setIsGeneratingVideo(false);
+//       }
+//     };
+//     pollStatus();
+//   }, [taskId]);
+
+//   // ... (handleDownload is unchanged) ...
+//   const handleDownload = async () => {
+//     try {
+//       await fetch(`${serverUrl}/cleanup/${taskId}`, { method: 'POST' });
+//       setTimeout(() => {
+//         URL.revokeObjectURL(videoDownloadUrl);
+//         setVideoDownloadUrl('');
+//         setTaskId(null);
+//       }, 1000);
+//     } catch (err) {
+//       console.error('Cleanup failed:', err);
+//     }
+//   };
+
+//   return (
+//     <div className="min-h-screen bg-gray-900 text-gray-100 p-8 flex flex-col items-center">
+//       <div className="w-full max-w-4xl bg-gray-800 rounded-3xl shadow-xl p-8 md:p-12 space-y-8">
+//         <header className="flex flex-col items-center text-center space-y-4">
+//           <Sparkles className="w-16 h-16 text-sky-400 animate-pulse" />
+//           <h1 className="text-4xl md:text-5xl font-extrabold text-white">Bulk Video Generator</h1>
+//           <p className="text-lg text-gray-400 max-w-2xl">
+//             Upload images for the slides and for the background/breaks.
+//           </p>
+//         </header>
+
+//         <main className="space-y-6">
+//           <div className="space-y-4">
+//             {/* --- 1. Topics Textarea --- */}
+//             <label htmlFor="topics-input" className="block text-sm font-medium text-gray-300">
+//               1. Paste Your Topics
+//             </label>
+//             <textarea
+//               id="topics-input"
+//               value={topicsText}
+//               onChange={(e) => setTopicsText(e.target.value)}
+//               placeholder="e.g.&#10;How to brew coffee at home&#10;The history of AI"
+//               rows={6}
+//               className="w-full p-4 bg-gray-700 text-white rounded-xl border border-gray-600 focus:border-sky-400 focus:ring-1 focus:ring-sky-400"
+//               disabled={isGeneratingVideo}
+//             />
+
+//             {/* --- 2. NEW: Side-by-Side Image Upload --- */}
+//             <label className="block text-sm font-medium text-gray-300">
+//               2. Upload Side-by-Side Images (Optional)
+//             </label>
+//             <label
+//               htmlFor="side-image-upload"
+//               className={`relative flex w-full justify-center p-4 bg-gray-700 text-white rounded-xl border-2 border-dashed border-gray-600 cursor-pointer
+//                 ${isGeneratingVideo ? 'opacity-50 cursor-not-allowed' : 'hover:border-sky-400'}
+//               `}
+//             >
+//               <input
+//                 id="side-image-upload"
+//                 type="file"
+//                 multiple
+//                 accept="image/*"
+//                 onChange={handleSideImageChange}
+//                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+//                 disabled={isGeneratingVideo}
+//               />
+//               <div className="flex flex-col items-center space-y-2 text-gray-400">
+//                 <LayoutPanelLeft className="w-8 h-8" />
+//                 {sideImageFiles.length > 0 ? (
+//                   <span className="font-semibold text-sky-300">{sideImageFiles.length} images selected</span>
+//                 ) : (
+//                   <span>Upload images for the slides</span>
+//                 )}
+//               </div>
+//             </label>
+
+//             {/* --- 3. NEW: Background Image Upload --- */}
+//             <label className="block text-sm font-medium text-gray-300">
+//               3. Upload Background/Break Images (Optional)
+//             </label>
+//             <label
+//               htmlFor="bg-image-upload"
+//               className={`relative flex w-full justify-center p-4 bg-gray-700 text-white rounded-xl border-2 border-dashed border-gray-600 cursor-pointer
+//                 ${isGeneratingVideo ? 'opacity-50 cursor-not-allowed' : 'hover:border-sky-400'}
+//               `}
+//             >
+//               <input
+//                 id="bg-image-upload"
+//                 type="file"
+//                 multiple
+//                 accept="image/*"
+//                 onChange={handleBgImageChange}
+//                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+//                 disabled={isGeneratingVideo}
+//               />
+//               <div className="flex flex-col items-center space-y-2 text-gray-400">
+//                 <PictureInPicture className="w-8 h-8" />
+//                 {bgImageFiles.length > 0 ? (
+//                   <span className="font-semibold text-sky-300">{bgImageFiles.length} images selected</span>
+//                 ) : (
+//                   <span>Upload images for background & breaks</span>
+//                 )}
+//               </div>
+//             </label>
+//           </div>
+
+//           {/* --- 4. Generate Button --- */}
+//           <button
+//             onClick={handleGenerateVideo}
+//             className={`w-full py-4 px-6 rounded-xl font-bold text-white transition
+//               ${isGeneratingVideo ? 'bg-indigo-600 cursor-not-allowed' : 'bg-indigo-500 hover:bg-indigo-600'}
+//               ${!topicsText ? 'opacity-50 cursor-not-allowed' : ''}`}
+//             disabled={!topicsText || isGeneratingVideo}
+//           >
+//             {isGeneratingVideo ? (
+//               <span className="flex items-center justify-center">
+//                 <Loader2 className="mr-2 h-5 w-5 animate-spin" /> Generating Videos...
+//               </span>
+//             ) : (
+//               <span className="flex items-center justify-center">
+//                 <Video className="mr-2 h-5 w-5" /> Generate Videos
+//               </span>
+//             )}
+//           </button>
+
+//           {/* ... (Error and Download sections are unchanged) ... */}
+//           {error && (
+//             <div className="bg-red-500 bg-opacity-20 text-red-300 p-4 rounded-xl border border-red-500 text-sm">
+//               <p>{error}</p>
+//             </div>
+//           )}
+//         </main>
+
+//         {videoDownloadUrl && !isGeneratingVideo && (
+//           <div className="mt-6">
+//             <div className="bg-emerald-500 bg-opacity-20 text-emerald-300 p-4 rounded-xl border border-emerald-500 text-sm flex items-center space-x-2">
+//               <CheckCircle size={20} />
+//               <p>All videos are ready and compressed into a single zip file.</p>
+//             </div>
+//             <a
+//               href={videoDownloadUrl}
+//               download="generated_videos.zip"
+//               className="mt-4 w-full py-4 px-6 rounded-xl font-bold text-white flex items-center justify-center bg-emerald-500 hover:bg-emerald-600"
+//               onClick={handleDownload}
+//             >
+//               <Download className="mr-2 h-5 w-5" /> Download Zip File
+//             </a>
+//           </div>
+//         )}
+//       </div>
+//     </div>
+//   );
+// };
+
+// export default App;
+
+
+// import React, { useState, useEffect } from 'react';
+// import { 
+//   Sparkles, Loader2, Video, Download, 
+//   LayoutPanelLeft, PictureInPicture, PlayCircle, SkipForward
+// } from 'lucide-react';
+// import './App.css';
+
+// const App = () => {
+//   // --- STATE ---
+//   const [topicsText, setTopicsText] = useState('');
+//   const [sideImageFiles, setSideImageFiles] = useState([]);
+//   const [bgImageFiles, setBgImageFiles] = useState([]); 
+  
+//   // Videos (NO middle video)
+//   const [startVideoFiles, setStartVideoFiles] = useState([]);
+//   const [endVideoFiles, setEndVideoFiles] = useState([]);
+
+//   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+//   const [videoDownloadUrl, setVideoDownloadUrl] = useState('');
+//   const [error, setError] = useState('');
+//   const [taskId, setTaskId] = useState(null);
+//   const [statusMessage, setStatusMessage] = useState('Initializing...');
+
+//   const serverUrl = 'http://localhost:8000'; 
+
+//   // --- API CALL ---
+//   const handleGenerateVideo = async () => {
+//     const topics = topicsText
+//       .split('\n')
+//       .map(t => t.trim())
+//       .filter(t => t.length > 0);
+
+//     if (topics.length === 0) {
+//       setError('Please paste at least one topic.');
+//       return;
+//     }
+
+//     setIsGeneratingVideo(true);
+//     setError('');
+//     setVideoDownloadUrl('');
+//     setTaskId(null);
+//     setStatusMessage('Uploading assets...');
+
+//     const formData = new FormData();
+//     formData.append('topics', JSON.stringify(topics));
+
+//     // Append Images
+//     Array.from(sideImageFiles).forEach(file =>
+//       formData.append('images_side', file)
+//     );
+//     Array.from(bgImageFiles).forEach(file =>
+//       formData.append('images_bg', file)
+//     );
+
+//     // Append Videos (backend expects single)
+//     if (startVideoFiles.length > 0)
+//       formData.append('start_video', startVideoFiles[0]);
+
+//     if (endVideoFiles.length > 0)
+//       formData.append('end_video', endVideoFiles[0]);
+
+//     try {
+//       const response = await fetch(`${serverUrl}/generate-bulk-videos`, {
+//         method: 'POST',
+//         body: formData,
+//       });
+
+//       if (!response.ok) throw new Error('Failed to start.');
+
+//       const { task_id } = await response.json();
+//       setTaskId(task_id);
+//       setStatusMessage('Queued for processing...');
+//     } catch (err) {
+//       setError(err.message);
+//       setIsGeneratingVideo(false);
+//     }
+//   };
+
+//   // --- POLLING ---
+//   useEffect(() => {
+//     if (!taskId) return;
+
+//     const pollStatus = async () => {
+//       try {
+//         const response = await fetch(`${serverUrl}/check-status/${taskId}`);
+//         const task = await response.json();
+        
+//         if (task.status === 'completed') {
+//           setStatusMessage('Downloading...');
+//           const dl = await fetch(`${serverUrl}/download/${taskId}`);
+//           const blob = await dl.blob();
+//           setVideoDownloadUrl(URL.createObjectURL(blob));
+//           setIsGeneratingVideo(false);
+//         } 
+//         else if (task.status === 'failed') {
+//           throw new Error(task.error || 'Failed');
+//         } 
+//         else {
+//           setStatusMessage('AI is generating script, audio and video...');
+//           setTimeout(pollStatus, 3000);
+//         }
+//       } catch (err) {
+//         setError(err.message);
+//         setIsGeneratingVideo(false);
+//       }
+//     };
+
+//     pollStatus();
+//   }, [taskId]);
+
+//   return (
+//     <div className="min-h-screen bg-gray-900 text-gray-100 p-4 md:p-8 flex flex-col items-center font-sans">
+//       <div className="w-full max-w-5xl bg-gray-800 rounded-3xl shadow-2xl p-6 md:p-10 space-y-8 border border-gray-700">
+        
+//         <header className="flex flex-col items-center text-center space-y-3">
+//           <div className="p-3 bg-gray-700 rounded-full shadow-inner">
+//             <Sparkles className="w-12 h-12 text-indigo-400 animate-pulse" />
+//           </div>
+//           <h1 className="text-3xl md:text-5xl font-extrabold text-white tracking-tight">
+//             AI Video Generator
+//           </h1>
+//           <p className="text-gray-400">Create High-Quality Auto-Generated Videos</p>
+//         </header>
+
+//         <main className="space-y-8">
+
+//           {/* TOPICS INPUT */}
+//           <div className="space-y-3">
+//             <label className="text-sm font-semibold text-indigo-300 uppercase">
+//               1. Topics
+//             </label>
+//             <textarea
+//               value={topicsText}
+//               onChange={(e) => setTopicsText(e.target.value)}
+//               placeholder="Enter one topic per line..."
+//               rows={5}
+//               className="w-full p-4 bg-gray-900 text-white rounded-xl border border-gray-700"
+//               disabled={isGeneratingVideo}
+//             />
+//           </div>
+
+//           {/* IMAGES */}
+//           <div className="space-y-3">
+//             <span className="text-sm font-semibold text-indigo-300 uppercase">
+//               2. Upload Images
+//             </span>
+
+//             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+//               {/* SIDE IMAGES */}
+//               <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
+//                                 flex flex-col items-center cursor-pointer">
+//                 <input 
+//                   type="file" 
+//                   multiple 
+//                   accept="image/*" 
+//                   onChange={(e) => setSideImageFiles(e.target.files)} 
+//                   className="hidden" 
+//                   disabled={isGeneratingVideo} 
+//                 />
+//                 <LayoutPanelLeft className="w-8 h-8 text-gray-400 mb-2" />
+//                 <span>Side Images ({sideImageFiles.length})</span>
+//               </label>
+
+//               {/* BACKGROUND IMAGES */}
+//               <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
+//                                 flex flex-col items-center cursor-pointer">
+//                 <input 
+//                   type="file" 
+//                   multiple 
+//                   accept="image/*" 
+//                   onChange={(e) => setBgImageFiles(e.target.files)} 
+//                   className="hidden" 
+//                   disabled={isGeneratingVideo} 
+//                 />
+//                 <PictureInPicture className="w-8 h-8 text-gray-400 mb-2" />
+//                 <span>Backgrounds ({bgImageFiles.length})</span>
+//               </label>
+//             </div>
+//           </div>
+
+//           {/* VIDEOS */}
+//           <div className="space-y-3">
+//             <span className="text-sm font-semibold text-indigo-300 uppercase">
+//               3. Videos (Intro + End)
+//             </span>
+
+//             <div className="grid grid-cols-2 gap-4">
+
+//               {/* START VIDEO */}
+//               <label className="p-4 bg-gray-700/30 rounded-xl border border-gray-600 
+//                                 flex flex-col items-center cursor-pointer">
+//                 <input 
+//                   type="file" 
+//                   accept="video/*"
+//                   onChange={(e) => setStartVideoFiles(e.target.files)}
+//                   className="hidden"
+//                   disabled={isGeneratingVideo}
+//                 />
+//                 <PlayCircle className="w-8 h-8 text-emerald-500 mb-2" />
+//                 <span className="text-xs font-bold text-emerald-200">Intro Video</span>
+//                 <span className="text-xs text-gray-500">
+//                   {startVideoFiles[0]?.name?.slice(0,15) || 'None'}
+//                 </span>
+//               </label>
+
+//               {/* END VIDEO */}
+//               <label className="p-4 bg-gray-700/30 rounded-xl border border-gray-600 
+//                                 flex flex-col items-center cursor-pointer">
+//                 <input 
+//                   type="file" 
+//                   accept="video/*"
+//                   onChange={(e) => setEndVideoFiles(e.target.files)}
+//                   className="hidden"
+//                   disabled={isGeneratingVideo}
+//                 />
+//                 <SkipForward className="w-8 h-8 text-rose-500 mb-2" />
+//                 <span className="text-xs font-bold text-rose-200">End Video</span>
+//                 <span className="text-xs text-gray-500">
+//                   {endVideoFiles[0]?.name?.slice(0,15) || 'None'}
+//                 </span>
+//               </label>
+
+//             </div>
+//           </div>
+
+//           {/* BUTTON */}
+//           <button
+//             onClick={handleGenerateVideo}
+//             disabled={!topicsText || isGeneratingVideo}
+//             className="w-full py-5 rounded-xl font-bold text-lg text-white 
+//                        bg-indigo-600 hover:bg-indigo-500 
+//                        shadow-lg flex items-center justify-center gap-2"
+//           >
+//             {isGeneratingVideo ? (
+//               <>
+//                 <Loader2 className="animate-spin" /> 
+//                 {statusMessage}
+//               </>
+//             ) : (
+//               <>
+//                 <Video /> Generate Videos
+//               </>
+//             )}
+//           </button>
+
+//           {/* ERROR */}
+//           {error && (
+//             <div className="p-4 bg-red-500/10 text-red-200 rounded-xl text-center">
+//               {error}
+//             </div>
+//           )}
+
+//           {/* DOWNLOAD */}
+//           {videoDownloadUrl && !isGeneratingVideo && (
+//             <a
+//               href={videoDownloadUrl}
+//               download="videos.zip"
+//               className="block w-full py-4 bg-emerald-600 text-white font-bold 
+//                          rounded-xl text-center flex items-center justify-center gap-2"
+//             >
+//               <Download /> Download Zip
+//             </a>
+//           )}
+//         </main>
+//       </div>
+//     </div>
+//   );
+// };
+
+// export default App;
+
+
+import React, { useState, useEffect } from 'react';
+import { 
+  Sparkles, Loader2, Video, Download, 
+  LayoutPanelLeft, PictureInPicture, PlayCircle
+} from 'lucide-react';
+import './App.css';
+
+const App = () => {
+  // --- STATE ---
+  const [topicsText, setTopicsText] = useState('');
+  const [sideImageFiles, setSideImageFiles] = useState([]);
+  const [bgImageFiles, setBgImageFiles] = useState([]); 
+  
+  // Intro Video (Only ONE video used for all topics)
+  const [introVideoFiles, setIntroVideoFiles] = useState([]);
+
+  const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+  const [videoDownloadUrl, setVideoDownloadUrl] = useState('');
+  const [error, setError] = useState('');
+  const [taskId, setTaskId] = useState(null);
+  const [statusMessage, setStatusMessage] = useState('Initializing...');
+
+  const serverUrl = 'http://localhost:8000'; 
+
+  // --- API CALL ---
+  const handleGenerateVideo = async () => {
+    const topics = topicsText
+      .split('\n')
+      .map(t => t.trim())
+      .filter(t => t.length > 0);
+
+    if (topics.length === 0) {
+      setError('Please enter at least one topic.');
+      return;
+    }
+
+    setIsGeneratingVideo(true);
+    setError('');
+    setVideoDownloadUrl('');
+    setTaskId(null);
+    setStatusMessage('Uploading assets...');
+
+    const formData = new FormData();
+    formData.append('topics', JSON.stringify(topics));
+
+    // Append Images
+    Array.from(sideImageFiles).forEach(file =>
+      formData.append('images_side', file)
+    );
+    Array.from(bgImageFiles).forEach(file =>
+      formData.append('images_bg', file)
+    );
+
+    // Append INTRO VIDEO (IMPORTANT FIX)
+    if (introVideoFiles.length > 0) {
+      formData.append('intro_video', introVideoFiles[0]);  // <-- FIXED
+    }
+
+    try {
+      const response = await fetch(`${serverUrl}/generate-bulk-videos`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error('Failed to start generation.');
+
+      const { task_id } = await response.json();
+      setTaskId(task_id);
+      setStatusMessage('Queued for processing...');
+    } catch (err) {
+      setError(err.message);
+      setIsGeneratingVideo(false);
+    }
+  };
+
+  // --- POLLING ---
+  useEffect(() => {
+    if (!taskId) return;
+
+    const pollStatus = async () => {
+      try {
+        const response = await fetch(`${serverUrl}/check-status/${taskId}`);
+        const task = await response.json();
+        
+        if (task.status === 'completed') {
+          setStatusMessage('Downloading results...');
+          const dl = await fetch(`${serverUrl}/download/${taskId}`);
+          const blob = await dl.blob();
+          setVideoDownloadUrl(URL.createObjectURL(blob));
+          setIsGeneratingVideo(false);
+        } 
+        else if (task.status === 'failed') {
+          throw new Error(task.error || 'Failed');
+        } 
+        else {
+          setStatusMessage('AI is generating script, audio, and video...');
+          setTimeout(pollStatus, 3000);
+        }
+      } catch (err) {
+        setError(err.message);
+        setIsGeneratingVideo(false);
+      }
+    };
+
+    pollStatus();
+  }, [taskId]);
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-gray-100 p-4 md:p-8 flex flex-col items-center font-sans">
+      <div className="w-full max-w-5xl bg-gray-800 rounded-3xl shadow-2xl p-6 md:p-10 space-y-8 border border-gray-700">
+        
+        <header className="flex flex-col items-center text-center space-y-3">
+          <div className="p-3 bg-gray-700 rounded-full shadow-inner">
+            <Sparkles className="w-12 h-12 text-indigo-400 animate-pulse" />
+          </div>
+          <h1 className="text-3xl md:text-5xl font-extrabold text-white tracking-tight">
+            AI Bulk Video Generator
+          </h1>
+          <p className="text-gray-400">Create High-Quality Auto-Generated Videos</p>
+        </header>
+
+        <main className="space-y-8">
+
+          {/* TOPICS INPUT */}
+          <div className="space-y-3">
+            <label className="text-sm font-semibold text-indigo-300 uppercase">
+              1. Topics
+            </label>
+            <textarea
+              value={topicsText}
+              onChange={(e) => setTopicsText(e.target.value)}
+              placeholder="Enter one topic per line..."
+              rows={5}
+              className="w-full p-4 bg-gray-900 text-white rounded-xl border border-gray-700"
+              disabled={isGeneratingVideo}
+            />
+          </div>
+
+          {/* IMAGES */}
+          <div className="space-y-3">
+            <span className="text-sm font-semibold text-indigo-300 uppercase">
+              2. Upload Images
+            </span>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* SIDE IMAGES */}
+              <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
+                                flex flex-col items-center cursor-pointer">
+                <input 
+                  type="file" 
+                  multiple 
+                  accept="image/*" 
+                  onChange={(e) => setSideImageFiles(e.target.files)} 
+                  className="hidden" 
+                  disabled={isGeneratingVideo} 
+                />
+                <LayoutPanelLeft className="w-8 h-8 text-gray-400 mb-2" />
+                <span>Side Images ({sideImageFiles.length})</span>
+              </label>
+
+              {/* BACKGROUND IMAGES */}
+              <label className="p-6 bg-gray-700/50 rounded-xl border-2 border-dashed border-gray-600 
+                                flex flex-col items-center cursor-pointer">
+                <input 
+                  type="file" 
+                  multiple 
+                  accept="image/*" 
+                  onChange={(e) => setBgImageFiles(e.target.files)} 
+                  className="hidden" 
+                  disabled={isGeneratingVideo} 
+                />
+                <PictureInPicture className="w-8 h-8 text-gray-400 mb-2" />
+                <span>Backgrounds ({bgImageFiles.length})</span>
+              </label>
+            </div>
+          </div>
+
+          {/* INTRO VIDEO */}
+          <div className="space-y-3">
+            <span className="text-sm font-semibold text-indigo-300 uppercase">
+              3. Intro Video (Used For Every Topic)
+            </span>
+
+            <label className="p-4 bg-gray-700/30 rounded-xl border border-gray-600 
+                              flex flex-col items-center cursor-pointer">
+              <input 
+                type="file" 
+                accept="video/*"
+                onChange={(e) => setIntroVideoFiles(e.target.files)}
+                className="hidden"
+                disabled={isGeneratingVideo}
+              />
+              <PlayCircle className="w-8 h-8 text-emerald-500 mb-2" />
+              <span className="text-xs font-bold text-emerald-200">Intro Video</span>
+              <span className="text-xs text-gray-500">
+                {introVideoFiles[0]?.name?.slice(0,25) || 'None'}
+              </span>
+            </label>
+          </div>
+
+          {/* GENERATE BUTTON */}
+          <button
+            onClick={handleGenerateVideo}
+            disabled={!topicsText || isGeneratingVideo}
+            className="w-full py-5 rounded-xl font-bold text-lg text-white 
+                       bg-indigo-600 hover:bg-indigo-500 
+                       shadow-lg flex items-center justify-center gap-2"
+          >
+            {isGeneratingVideo ? (
+              <>
+                <Loader2 className="animate-spin" /> 
+                {statusMessage}
+              </>
+            ) : (
+              <>
+                <Video /> Generate Videos
+              </>
+            )}
+          </button>
+
+          {/* ERROR */}
+          {error && (
+            <div className="p-4 bg-red-500/10 text-red-200 rounded-xl text-center">
+              {error}
+            </div>
+          )}
+
+          {/* DOWNLOAD BUTTON */}
+          {videoDownloadUrl && !isGeneratingVideo && (
+            <a
+              href={videoDownloadUrl}
+              download="generated_videos.zip"
+              className="block w-full py-4 bg-emerald-600 text-white font-bold 
+                         rounded-xl text-center flex items-center justify-center gap-2"
+            >
+              <Download /> Download Zip
+            </a>
+          )}
+
+        </main>
+      </div>
+    </div>
+  );
+};
+
+export default App;
